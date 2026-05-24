@@ -6,10 +6,12 @@ _P_LONG = (
     "/Users/justinadams/Desktop/middleout/middleout-claude-proxy/"
     "src/middleout_proxy/long_path.py"
 )
-# 70-char path appearing 4 times — caught at standard + aggressive (not lite,
+# 64-char path appearing 4 times — caught at standard + aggressive (not lite,
 # which needs >=5 occurrences and >=80 chars)
 _P_MID = "/Users/justin/Documents/projects/some-medium-name/sub/dir/file.py"
-# 41-char path appearing 2 times — caught only at aggressive
+# 41-char path appearing 3 times — caught only at aggressive (standard's
+# minimum length is 60 chars). With 3 occurrences, net savings stay positive
+# after legend overhead.
 _P_SHORT = "/Users/justin/work/short_path/file_xyz.py"
 
 
@@ -19,7 +21,7 @@ def _build_fixture() -> str:
         chunks.append("see " + _P_LONG)
     for _ in range(4):
         chunks.append("and " + _P_MID)
-    for _ in range(2):
+    for _ in range(3):
         chunks.append("or " + _P_SHORT)
     chunks.append("Some unrelated text without any path.")
     return "\n".join(chunks)

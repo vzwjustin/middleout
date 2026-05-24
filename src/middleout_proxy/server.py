@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import time
 from typing import Any
@@ -12,6 +11,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from .audit import AuditLogger
+from .cache import CachedResponse, L1Cache, cache_key
 from .cache_wall import compute_wall
 from .compression import CompressionAudit, PayloadCompressor
 from .config import Settings, load_settings
@@ -49,6 +49,13 @@ lingua_compressor = LinguaCompressor(
     model_id=settings.lingua_model_id,
     default_ratio=settings.lingua_ratio,
 )
+l1_cache: L1Cache | None = None
+if settings.l1_cache_enabled:
+    l1_cache = L1Cache(
+        settings.l1_cache_db_path,
+        max_entries=settings.l1_cache_max_entries,
+        max_body_bytes=settings.l1_cache_max_body_bytes,
+    )
 
 _CAVEMAN_LEVELS = {"lite", "standard", "aggressive", "ultra"}
 _RTK_LEVELS = {"minimal", "standard", "aggressive"}
@@ -70,6 +77,7 @@ _runtime: dict = {
     "rtk": {"enabled": settings.rtk_enabled, "level": settings.rtk_level},
     "lingua": {"enabled": settings.lingua_enabled, "ratio": settings.lingua_ratio},
     "auto_insert_wall": settings.auto_insert_cache_wall,
+    "l1_cache": settings.l1_cache_enabled,
 }
 
 def _load_persisted_runtime() -> None:
@@ -136,6 +144,8 @@ async def healthz() -> dict[str, Any]:
         "lingua_ratio": _runtime["lingua"]["ratio"],
         "lingua_model_loaded": lingua_compressor.is_loaded,
         "auto_insert_cache_wall": _runtime["auto_insert_wall"],
+        "l1_cache_enabled": _runtime["l1_cache"] and l1_cache is not None,
+        "l1_cache_backend": settings.l1_cache_db_path if l1_cache is not None else None,
         "preserve_anthropic_cache": settings.preserve_anthropic_cache,
         "compression_cache_enabled": settings.compression_cache_enabled,
         "auth_mode": settings.auth_mode,
@@ -190,6 +200,7 @@ def _snapshot_runtime() -> dict[str, Any]:
         "output_compression": _runtime["output_compression"],
         "jl_dedupe": _runtime["jl_dedupe"],
         "auto_insert_wall": _runtime["auto_insert_wall"],
+        "l1_cache": _runtime["l1_cache"],
         "caveman": dict(_runtime["caveman"]),
         "rtk": dict(_runtime["rtk"]),
         "lingua": dict(_runtime["lingua"]),
@@ -204,7 +215,7 @@ async def post_settings(request: Request) -> Response:
 
 
 async def _post_settings_locked(body: dict) -> Response:
-    for k in ("input_compression", "output_compression", "jl_dedupe", "auto_insert_wall"):
+    for k in ("input_compression", "output_compression", "jl_dedupe", "auto_insert_wall", "l1_cache"):
         if k in body:
             _runtime[k] = bool(body[k])
 
@@ -312,6 +323,10 @@ async def proxy(path: str, request: Request) -> Response:
     outgoing_content: bytes | None = body_bytes if body_bytes else None
     wall_auto_inserted = False
     lingua_chars_saved = 0
+    # `cache_lookup_payload` is the payload we'll key L1 cache on — set when
+    # we have a JSON-shaped /v1/messages request. Captured AFTER compression
+    # so two requests that compress to the same bytes share a cache entry.
+    cache_lookup_payload: dict[str, Any] | None = None
 
     # FIX A: snapshot _runtime once under the lock. All subsequent reads in
     # this handler use the snapshot, so a concurrent POST /settings cannot
@@ -363,6 +378,7 @@ async def proxy(path: str, request: Request) -> Response:
                 ).encode("utf-8")
                 request_headers["content-type"] = "application/json"
             # else: outgoing_content stays as body_bytes — byte-identical passthrough
+            cache_lookup_payload = transformed
     except Exception as exc:  # Keep the proxy useful even if compression fails.
         request_audit.events.clear()
         request_headers["x-middleout-warning"] = f"compression skipped: {type(exc).__name__}"
@@ -371,6 +387,56 @@ async def proxy(path: str, request: Request) -> Response:
         wall_auto_inserted = False
 
     method = request.method.upper()
+
+    # L1 EXACT-MATCH CACHE LOOKUP (non-streaming only).
+    # The key is computed on the COMPRESSED payload — two clients that compress
+    # to the same bytes share the cache. Streaming requests are not cached this
+    # phase: SSE chunk-boundary replay deserves its own implementation.
+    l1_status: str | None = None
+    l1_key: str | None = None
+    cache_active = (
+        rt["l1_cache"]
+        and l1_cache is not None
+        and cache_lookup_payload is not None
+        and method == "POST"
+        and path.strip("/") == "v1/messages"
+        and not cache_lookup_payload.get("stream", False)
+    )
+    if cache_active:
+        try:
+            l1_key = cache_key(cache_lookup_payload)  # type: ignore[arg-type]
+            cached = l1_cache.get(l1_key)  # type: ignore[union-attr]
+        except Exception:
+            cached = None
+        if cached is not None:
+            l1_status = "hit"
+            cached_headers = dict(cached.headers)
+            cached_headers["x-brain-l1-cache"] = "hit"
+            cached_headers["x-brain-l1-hit-count"] = str(cached.hit_count)
+            cached_headers.update(
+                _brain_headers(
+                    lingua_chars_saved=lingua_chars_saved,
+                    wall_auto_inserted=wall_auto_inserted,
+                )
+            )
+            audit_logger.record(
+                method=method,
+                path=path,
+                status_code=cached.status_code,
+                request_audit=request_audit,
+                request_id=cached_headers.get("request-id"),
+                latency_ms=(time.perf_counter() - started_perf) * 1000.0,
+                bytes_in=bytes_in,
+                bytes_out=len(cached.body),
+            )
+            return Response(
+                content=cached.body,
+                status_code=cached.status_code,
+                headers=cached_headers,
+                media_type=cached.media_type,
+            )
+        l1_status = "miss"
+
     try:
         if _is_streaming_messages(path, outgoing_content):
             return await _streaming_forward(
@@ -397,6 +463,8 @@ async def proxy(path: str, request: Request) -> Response:
                 wall_auto_inserted=wall_auto_inserted,
             )
         )
+        if l1_status is not None:
+            response_headers["x-brain-l1-cache"] = l1_status
 
         response_content = upstream_response.content
         response_audit: CompressionAudit | None = None
@@ -426,6 +494,23 @@ async def proxy(path: str, request: Request) -> Response:
             bytes_in=bytes_in,
             bytes_out=len(response_content) if response_content else 0,
         )
+
+        # L1 CACHE STORE: on a successful upstream response, populate the cache
+        # for next time. `l1_cache.put` filters status_code internally (only 2xx
+        # are stored) and strips auth-leaking headers defensively.
+        if cache_active and l1_key is not None and 200 <= upstream_response.status_code < 300:
+            try:
+                l1_cache.put(  # type: ignore[union-attr]
+                    l1_key,
+                    CachedResponse(
+                        status_code=upstream_response.status_code,
+                        headers=dict(response_headers),
+                        body=bytes(response_content) if response_content else b"",
+                        media_type=upstream_response.headers.get("content-type"),
+                    ),
+                )
+            except Exception:
+                pass  # cache store failure must never fail a request
 
         return Response(
             content=response_content,

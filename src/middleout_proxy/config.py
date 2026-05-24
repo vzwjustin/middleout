@@ -108,6 +108,15 @@ class Settings:
     # mutation is documented in the response header `x-brain-wall-inserted`.
     auto_insert_cache_wall: bool = _bool_env("BRAIN_AUTO_INSERT_WALL", True)
 
+    # L1 exact-match response cache (Phase 2). SHA-256 of the normalized
+    # post-compression payload keys a SQLite store of full responses. Off by
+    # default — opt-in until response-replay semantics are vetted in production.
+    # Streaming requests are intentionally not cached in this phase.
+    l1_cache_enabled: bool = _bool_env("BRAIN_L1_CACHE_ENABLED", False)
+    l1_cache_db_path: str = os.getenv("BRAIN_L1_CACHE_DB", ":memory:")
+    l1_cache_max_entries: int = _int_env("BRAIN_L1_CACHE_MAX_ENTRIES", 10_000)
+    l1_cache_max_body_bytes: int = _int_env("BRAIN_L1_CACHE_MAX_BODY_BYTES", 5 * 1024 * 1024)
+
     # Local LRU cache for deterministic post-JL compression output. Independent of
     # Anthropic's native cache; only avoids local CPU work on repeated text.
     compression_cache_enabled: bool = _bool_env("MIDDLEOUT_COMPRESSION_CACHE", True)

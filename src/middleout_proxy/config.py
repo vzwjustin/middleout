@@ -424,6 +424,22 @@ class Settings:
         "MIDDLEOUT_RECENT_MAX", _toml_default("recent_max", 200)
     ))
 
+    # Rate limit (Phase 4 — local DOS protection). Per-client token bucket
+    # keyed on a SHA-256 prefix of the Authorization header. Off by default;
+    # turn on with BRAIN_RATE_LIMIT_ENABLED=1. The dashboard chip flips it
+    # live without a restart. capacity = burst budget; refill = sustained
+    # requests per second per client.
+    rate_limit_enabled: bool = field(default_factory=lambda: _bool_env(
+        "BRAIN_RATE_LIMIT_ENABLED", _toml_default("rate_limit_enabled", False)
+    ))
+    rate_limit_capacity: int = field(default_factory=lambda: _int_env(
+        "BRAIN_RATE_LIMIT_CAPACITY", _toml_default("rate_limit_capacity", 120)
+    ))
+    rate_limit_refill_per_second: float = field(default_factory=lambda: _float_env(
+        "BRAIN_RATE_LIMIT_REFILL_PER_SECOND",
+        _toml_default("rate_limit_refill_per_second", 2.0),
+    ))
+
     # HTTP behavior
     timeout_connect_s: float = field(default_factory=lambda: _float_env(
         "MIDDLEOUT_CONNECT_TIMEOUT_S", _toml_default("timeout_connect_s", 30.0)

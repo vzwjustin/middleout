@@ -28,9 +28,16 @@ def _reset_server_runtime() -> "object":
     (e.g. enabling l1_cache or l2_cache) leaks state into the next test
     and causes order-dependent flakes. The fixture is best-effort: if
     server.py hasn't been imported yet we no-op.
+
+    Also restores the module-level singletons (`policy_router`,
+    `request_limiter`) so tests that monkey-patch them in-place don't bleed
+    state into the next test. We rebuild a fresh limiter so any buckets
+    a test populated are dropped between runs.
     """
     try:
         from middleout_proxy import server as _srv
+        from middleout_proxy.policies import PolicyRouter
+        from middleout_proxy.rate_limit import RequestLimiter
     except Exception:
         yield
         return
@@ -42,6 +49,11 @@ def _reset_server_runtime() -> "object":
         l2_enabled_snapshot = bool(_srv.l2_cache.enabled)
     except Exception:
         l2_enabled_snapshot = None
+    # Snapshot the policy router and a fresh limiter recipe so that tests
+    # that swap them out get the originals back.
+    policy_router_snapshot = _srv.policy_router
+    request_limiter_capacity = _srv.request_limiter.capacity
+    request_limiter_refill = _srv.request_limiter.refill_per_second
     try:
         yield
     finally:
@@ -52,6 +64,37 @@ def _reset_server_runtime() -> "object":
                 _srv.l2_cache.enabled = l2_enabled_snapshot
             except Exception:
                 pass
+        # Clear L1 cache contents so entries from one test don't satisfy a
+        # cache lookup in the next. The L1 cache object itself is preserved
+        # (tests that monkey-patch `server.l1_cache` already get a fresh one).
+        try:
+            if _srv.l1_cache is not None:
+                _srv.l1_cache.clear()
+        except Exception:
+            pass
+        # Clear L2 cache (in-memory vector store) so a previous test's
+        # populated vectors don't trigger spurious near-duplicate hits.
+        try:
+            if _srv.l2_cache is not None and hasattr(_srv.l2_cache, "vector_store"):
+                vs = _srv.l2_cache.vector_store
+                if hasattr(vs, "_entries"):
+                    vs._entries.clear()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        # Drop any in-flight buckets and replace the limiter with a fresh one
+        # built from the same recipe; preserves the module-level identity
+        # for tests that don't monkey-patch but want a clean slate.
+        _srv.request_limiter = RequestLimiter(
+            capacity=request_limiter_capacity,
+            refill_per_second=request_limiter_refill,
+        )
+        _srv.policy_router = policy_router_snapshot
+        # Best-effort: refresh the vanilla router if its rules look mutated.
+        try:
+            if not isinstance(_srv.policy_router, PolicyRouter):
+                _srv.policy_router = PolicyRouter.from_env()
+        except Exception:
+            pass
 
 
 @pytest.fixture

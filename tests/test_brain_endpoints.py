@@ -554,3 +554,270 @@ def test_persisted_l2_runtime_flag_syncs_l2cache_enabled(tmp_path) -> None:
     assert out["settings_l2"] is True
 
 
+# -- /rate-limit + policy router wiring (Phase 4) --------------------------
+
+
+def test_rate_limit_endpoint_returns_state() -> None:
+    """`/rate-limit` exposes the token-bucket bookkeeping plus the runtime flag."""
+    from middleout_proxy.server import app
+
+    with TestClient(app) as client:
+        r = client.get("/rate-limit")
+    assert r.status_code == 200
+    body = r.json()
+    assert "enabled" in body
+    assert "active_buckets" in body
+    assert "capacity" in body
+    assert "refill_per_second" in body
+    assert "policies_rules" in body
+    assert "policies_default_is_vanilla" in body
+    # Defaults: capacity is positive, refill is positive.
+    assert body["capacity"] > 0
+    assert body["refill_per_second"] > 0
+
+
+def test_rate_limit_returns_429_when_exhausted(monkeypatch) -> None:
+    """When rate_limit is enabled, exhausting the bucket yields a 429 with
+    `x-brain-rate-limit: exceeded` and a `retry-after` header. Bucket key is a
+    hash of the Authorization header, so raw tokens never reach the limiter.
+    """
+    from middleout_proxy import server as server_module
+
+    class _Resp:
+        status_code = 200
+        content = b'{"id":"m1","model":"claude-3-5-sonnet","content":[]}'
+        headers = {"content-type": "application/json"}
+
+        def json(self):  # noqa: D401
+            import json as _j
+
+            return _j.loads(self.content.decode("utf-8"))
+
+    class _FakeClient:
+        async def request(self, *args, **kwargs):
+            return _Resp()
+
+        async def aclose(self):
+            pass
+
+    # Swap in a tiny bucket so we don't need 60+ requests to exhaust it.
+    from middleout_proxy.rate_limit import RequestLimiter
+
+    original_limiter = server_module.request_limiter
+    tiny = RequestLimiter(capacity=2, refill_per_second=0.001)
+    monkeypatch.setattr(server_module, "request_limiter", tiny)
+    monkeypatch.setitem(server_module._runtime, "rate_limit", True)
+    try:
+        with TestClient(server_module.app) as client:
+            monkeypatch.setattr(server_module.app.state, "http", _FakeClient())
+            # First two go through.
+            for _ in range(2):
+                r = client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer t"},
+                    json={"model": "claude-3-5-sonnet", "messages": []},
+                )
+                assert r.status_code == 200
+            # Third one exhausts the bucket.
+            r = client.post(
+                "/v1/messages",
+                headers={"Authorization": "Bearer t"},
+                json={"model": "claude-3-5-sonnet", "messages": []},
+            )
+            assert r.status_code == 429
+            assert r.headers["x-brain-rate-limit"] == "exceeded"
+            assert "retry-after" in r.headers
+            body = r.json()
+            assert body["error"]["type"] == "rate_limit_error"
+    finally:
+        monkeypatch.setattr(server_module, "request_limiter", original_limiter)
+
+
+def test_rate_limit_off_by_default_passes_through(monkeypatch) -> None:
+    """When rate_limit toggle is off, an empty bucket is irrelevant — all
+    traffic flows through to upstream.
+    """
+    from middleout_proxy import server as server_module
+
+    class _Resp:
+        status_code = 200
+        content = b'{"id":"m1","model":"claude-3-5-sonnet","content":[]}'
+        headers = {"content-type": "application/json"}
+
+        def json(self):  # noqa: D401
+            import json as _j
+
+            return _j.loads(self.content.decode("utf-8"))
+
+    class _FakeClient:
+        async def request(self, *args, **kwargs):
+            return _Resp()
+
+        async def aclose(self):
+            pass
+
+    from middleout_proxy.rate_limit import RequestLimiter
+
+    original_limiter = server_module.request_limiter
+    tiny = RequestLimiter(capacity=1, refill_per_second=0.001)
+    monkeypatch.setattr(server_module, "request_limiter", tiny)
+    monkeypatch.setitem(server_module._runtime, "rate_limit", False)
+    try:
+        with TestClient(server_module.app) as client:
+            monkeypatch.setattr(server_module.app.state, "http", _FakeClient())
+            # 5 requests, well over capacity — all should pass.
+            for _ in range(5):
+                r = client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer t"},
+                    json={"model": "claude-3-5-sonnet", "messages": []},
+                )
+                assert r.status_code == 200
+    finally:
+        monkeypatch.setattr(server_module, "request_limiter", original_limiter)
+
+
+def test_policies_endpoint_returns_rules_and_default() -> None:
+    """`/policies` exposes the PolicyRouter's loaded rules and default policy."""
+    from middleout_proxy.server import app
+
+    with TestClient(app) as client:
+        r = client.get("/policies")
+    assert r.status_code == 200
+    body = r.json()
+    assert "rules" in body and isinstance(body["rules"], list)
+    assert "default" in body and isinstance(body["default"], dict)
+    # Default policy advertises the expected fields.
+    for k in (
+        "input_compression",
+        "output_compression",
+        "jl_dedupe",
+        "caveman_enabled",
+        "caveman_level",
+        "rtk_enabled",
+        "rtk_level",
+        "max_text_chars",
+    ):
+        assert k in body["default"]
+
+
+def test_policy_router_overrides_runtime_settings(monkeypatch) -> None:
+    """A model-glob policy match overrides the runtime engine settings for
+    that request only, without persisting any change.
+    """
+    from middleout_proxy import server as server_module
+    from middleout_proxy.policies import (
+        CompressionPolicy,
+        PolicyMatch,
+        PolicyRouter,
+    )
+
+    captured: dict[str, bytes | None] = {"content": None}
+
+    class _Resp:
+        status_code = 200
+        content = b'{"id":"m1","model":"claude-3-5-sonnet","content":[]}'
+        headers = {"content-type": "application/json"}
+
+        def json(self):  # noqa: D401
+            import json as _j
+
+            return _j.loads(self.content.decode("utf-8"))
+
+    class _FakeClient:
+        async def request(self, *args, **kwargs):
+            captured["content"] = kwargs.get("content")
+            return _Resp()
+
+        async def aclose(self):
+            pass
+
+    # Policy: disable all compression for `claude-3-5-haiku*`. The body bytes
+    # the proxy forwards upstream must therefore equal the original request
+    # bytes — no compression applied.
+    no_compression = CompressionPolicy(
+        input_compression=False,
+        output_compression=False,
+        jl_dedupe=False,
+        caveman_enabled=False,
+        rtk_enabled=False,
+    )
+    router = PolicyRouter(
+        rules=[
+            PolicyMatch(
+                model_glob="claude-3-5-haiku*",
+                endpoint="v1/messages",
+                policy=no_compression,
+            ),
+        ],
+    )
+    monkeypatch.setattr(server_module, "policy_router", router)
+
+    # Force the runtime to have engines fully ON, so the only way the request
+    # body passes through unchanged is if the policy override fires.
+    monkeypatch.setitem(server_module._runtime, "input_compression", True)
+
+    big_payload = {
+        "model": "claude-3-5-haiku-latest",
+        "messages": [
+            {
+                "role": "user",
+                "content": "the quick brown fox " * 500,
+            }
+        ],
+    }
+    import json as _json
+
+    expected_bytes = _json.dumps(big_payload).encode("utf-8")
+
+    with TestClient(server_module.app) as client:
+        monkeypatch.setattr(server_module.app.state, "http", _FakeClient())
+        r = client.post(
+            "/v1/messages",
+            headers={
+                "Authorization": "Bearer t",
+                "Content-Type": "application/json",
+            },
+            content=expected_bytes,
+        )
+    assert r.status_code == 200
+    # Policy turned off input_compression for this model — proxy must forward
+    # the original bytes verbatim.
+    assert captured["content"] == expected_bytes
+
+
+def test_policies_default_unchanged_when_no_rules() -> None:
+    """With an empty rules list and a vanilla default policy, behavior matches
+    the legacy `_runtime` toggle path. /policies just reports the defaults.
+    """
+    from middleout_proxy.server import app
+    from middleout_proxy import server as server_module
+    from middleout_proxy.policies import CompressionPolicy, PolicyRouter
+
+    # Restore a vanilla router for this test (auto-fixture restores after).
+    vanilla = PolicyRouter(rules=[], default=CompressionPolicy())
+    server_module.policy_router = vanilla
+
+    with TestClient(app) as client:
+        body = client.get("/policies").json()
+    assert body["rules"] == []
+    # The vanilla default has all engines on, max_text_chars sized for sanity.
+    assert body["default"]["input_compression"] is True
+    assert body["default"]["output_compression"] is False
+    assert body["default"]["jl_dedupe"] is True
+
+
+def test_healthz_advertises_rate_limit_state() -> None:
+    """`/healthz` reports `rate_limit_*` so operators can confirm wiring."""
+    from middleout_proxy.server import app
+
+    with TestClient(app) as client:
+        body = client.get("/healthz").json()
+    assert "rate_limit_enabled" in body
+    assert "rate_limit_capacity" in body
+    assert "rate_limit_refill_per_second" in body
+    assert isinstance(body["rate_limit_enabled"], bool)
+    assert body["rate_limit_capacity"] > 0
+    assert body["rate_limit_refill_per_second"] > 0
+
+

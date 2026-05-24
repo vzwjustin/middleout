@@ -81,16 +81,20 @@ def test_dashboard_bindings_exist_for_every_toggle():
     )
 
 
-def test_dashboard_readability_v2_palette_contrast():
-    # Regression: dashboard text/sub/muted colors must stay at the v2
-    # high-contrast values. Reverting these drops legibility on dark bg.
+def test_dashboard_readability_v3_light_theme_palette():
+    # Dashboard switched from dark v2 to a bright light theme. These tokens
+    # must stay at the v3 high-contrast values; reverting these drops
+    # readability against the white surface.
     for needle in (
-        "--text:#f5f8fc",
-        "--sub:#c2cde0",
-        "--muted:#8e98ad",
+        "--bg:#f8fafc",
+        "--surface:#ffffff",
+        "--text:#0f172a",
+        "--sub:#334155",
+        "--muted:#64748b",
+        "--blue:#2563eb",
     ):
         assert needle in _DASHBOARD_HTML, (
-            f"dashboard CSS lost the v2 readability palette token: {needle}"
+            f"dashboard CSS lost the v3 light-theme palette token: {needle}"
         )
 
 
@@ -115,4 +119,18 @@ def test_dashboard_has_a11y_focus_styles():
     # guard so dark-on-dark focus doesn't sneak back.
     assert "*:focus-visible{outline" in _DASHBOARD_HTML, (
         "global :focus-visible rule missing -- keyboard nav loses focus ring"
+    )
+
+
+def test_dashboard_has_rate_limit_toggle():
+    # Phase 4 rate-limit toggle lives in the Brain section. Without this
+    # wiring the user can't flip the limiter on/off from the dashboard.
+    assert 'id="t-rate_limit"' in _DASHBOARD_HTML, (
+        "rate_limit toggle id missing from dashboard DOM"
+    )
+    assert "bindToggle('rate_limit')" in _DASHBOARD_HTML, (
+        "rate_limit toggle has no bindToggle() wiring -- click does nothing"
+    )
+    assert "fetch('/rate-limit')" in _DASHBOARD_HTML, (
+        "dashboard doesn't poll /rate-limit -- chip will never update"
     )

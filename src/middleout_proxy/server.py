@@ -26,11 +26,12 @@ from .cost import CostTracker, estimate as estimate_cost, extract_usage_from_ant
 from .dashboard import _DASHBOARD_HTML
 from .lingua import LinguaCompressor
 from .metrics import render_prometheus
-from .policies import PolicyRouter
+from .policies import CompressionPolicy, PolicyRouter
 from .preview import preview_compression
 from .providers import REGISTRY as PROVIDER_REGISTRY
 from .providers import AdapterNotImplemented, select_adapter
 from .providers.registry import routes_snapshot as _routes_snapshot
+from .rate_limit import RequestLimiter
 from .volatile import compress_volatile_tail
 
 HOP_BY_HOP_HEADERS = {
@@ -163,6 +164,15 @@ usage_budget = UsageBudget(char_limit=None, token_limit=None)
 # failure — invalid policy JSON is operator error, not a runtime fallback.
 policy_router = PolicyRouter.from_env()
 
+# Per-client rate limiter. Always-constructed so the runtime toggle can flip
+# it on without a restart; the runtime `rate_limit` flag alone gates the
+# check. Keyed on a SHA-256 prefix of the Authorization header so raw
+# bearer tokens never reach the limiter.
+request_limiter = RequestLimiter(
+    capacity=settings.rate_limit_capacity,
+    refill_per_second=settings.rate_limit_refill_per_second,
+)
+
 _CAVEMAN_LEVELS = {"lite", "standard", "aggressive", "ultra"}
 _RTK_LEVELS = {"minimal", "standard", "aggressive"}
 _JSON_AWARE_LEVELS = {"safe", "standard", "aggressive"}
@@ -190,6 +200,7 @@ _runtime: dict = {
     "auto_insert_wall": settings.auto_insert_cache_wall,
     "l1_cache": settings.l1_cache_enabled,
     "l2_cache": l2_cache.enabled,
+    "rate_limit": settings.rate_limit_enabled,
 }
 
 def _load_persisted_runtime() -> None:
@@ -197,7 +208,7 @@ def _load_persisted_runtime() -> None:
         saved = json.loads(_RUNTIME_PERSIST_PATH.read_text())
         if not isinstance(saved, dict):
             return
-        for k in ("input_compression", "output_compression", "jl_dedupe", "auto_insert_wall", "adaptive", "l1_cache", "l2_cache"):
+        for k in ("input_compression", "output_compression", "jl_dedupe", "auto_insert_wall", "adaptive", "l1_cache", "l2_cache", "rate_limit"):
             if k in saved:
                 _runtime[k] = bool(saved[k])
         for engine_key in ("caveman", "rtk", "lingua", "json_aware", "lsh"):
@@ -319,7 +330,10 @@ async def healthz() -> dict[str, Any]:
         "api_key_headers_rejected": True,
         "api_keys_supported": False,
         "providers": sorted(PROVIDER_REGISTRY.keys()),
-        "phase": "1-cache-aware-compression + 2a-l1-cache + 2b-l2-stub + 3-provider-scaffold",
+        "rate_limit_enabled": _runtime["rate_limit"],
+        "rate_limit_capacity": request_limiter.capacity,
+        "rate_limit_refill_per_second": request_limiter.refill_per_second,
+        "phase": "1-cache-aware-compression + 2a-l1-cache + 2b-l2-stub + 3-provider-scaffold + 4-rate-limit+policies",
     }
 
 
@@ -377,6 +391,7 @@ def _snapshot_runtime() -> dict[str, Any]:
         "auto_insert_wall": _runtime["auto_insert_wall"],
         "l1_cache": _runtime["l1_cache"],
         "l2_cache": _runtime["l2_cache"],
+        "rate_limit": _runtime["rate_limit"],
         "adaptive": _runtime["adaptive"],
         "caveman": dict(_runtime["caveman"]),
         "rtk": dict(_runtime["rtk"]),
@@ -394,7 +409,7 @@ async def post_settings(request: Request) -> Response:
 
 
 async def _post_settings_locked(body: dict) -> Response:
-    for k in ("input_compression", "output_compression", "jl_dedupe", "auto_insert_wall", "l1_cache", "l2_cache", "adaptive"):
+    for k in ("input_compression", "output_compression", "jl_dedupe", "auto_insert_wall", "l1_cache", "l2_cache", "adaptive", "rate_limit"):
         if k in body:
             _runtime[k] = bool(body[k])
 
@@ -592,6 +607,56 @@ async def budget() -> dict[str, Any]:
     return usage_budget.snapshot()
 
 
+@app.get("/rate-limit")
+async def rate_limit() -> dict[str, Any]:
+    """Per-client token-bucket state. Buckets are keyed on a hash of each
+    client's Authorization header; raw tokens never appear here. Tracking is
+    informational regardless of the enabled toggle — the toggle only gates
+    enforcement at request time.
+    """
+    snap = request_limiter.stats()
+    snap["enabled"] = _runtime["rate_limit"]
+    snap["policies_rules"] = len(policy_router.rules)
+    snap["policies_default_is_vanilla"] = (
+        policy_router.default == CompressionPolicy()
+    )
+    return snap
+
+
+@app.get("/policies")
+async def policies_route() -> dict[str, Any]:
+    """Current per-(model, endpoint) compression policy router config."""
+    rules_out = []
+    for r in policy_router.rules:
+        rules_out.append({
+            "model_glob": r.model_glob,
+            "endpoint": r.endpoint,
+            "policy": {
+                "input_compression": r.policy.input_compression,
+                "output_compression": r.policy.output_compression,
+                "jl_dedupe": r.policy.jl_dedupe,
+                "caveman_enabled": r.policy.caveman_enabled,
+                "caveman_level": r.policy.caveman_level,
+                "rtk_enabled": r.policy.rtk_enabled,
+                "rtk_level": r.policy.rtk_level,
+                "max_text_chars": r.policy.max_text_chars,
+            },
+        })
+    return {
+        "rules": rules_out,
+        "default": {
+            "input_compression": policy_router.default.input_compression,
+            "output_compression": policy_router.default.output_compression,
+            "jl_dedupe": policy_router.default.jl_dedupe,
+            "caveman_enabled": policy_router.default.caveman_enabled,
+            "caveman_level": policy_router.default.caveman_level,
+            "rtk_enabled": policy_router.default.rtk_enabled,
+            "rtk_level": policy_router.default.rtk_level,
+            "max_text_chars": policy_router.default.max_text_chars,
+        },
+    }
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def proxy(path: str, request: Request) -> Response:
     # Local endpoints are handled above, but keep a guard for accidental empty path.
@@ -680,6 +745,39 @@ async def proxy(path: str, request: Request) -> Response:
     async with _runtime_lock:
         rt = _snapshot_runtime()
 
+    # RATE LIMIT (Phase 4). Per-client token bucket keyed on a SHA-256 prefix
+    # of the Authorization header. Raw bearer tokens are never persisted or
+    # logged — the limiter only sees the hash. Off by default; flip via
+    # /settings POST {"rate_limit": true} or BRAIN_RATE_LIMIT_ENABLED=1.
+    if rt["rate_limit"]:
+        auth_header = request.headers.get("authorization") or ""
+        if auth_header:
+            import hashlib as _hashlib
+            client_key = _hashlib.sha256(auth_header.encode("utf-8")).hexdigest()[:16]
+            try:
+                allowed = await request_limiter.check(client_key)
+            except Exception:
+                allowed = True  # never break a real request on a limiter bug
+            if not allowed:
+                return JSONResponse(
+                    status_code=429,
+                    headers={
+                        "retry-after": "1",
+                        "x-brain-rate-limit": "exceeded",
+                    },
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "rate_limit_error",
+                            "message": (
+                                f"client exceeded local rate limit "
+                                f"({request_limiter.capacity} req burst, "
+                                f"{request_limiter.refill_per_second}/s sustained)"
+                            ),
+                        },
+                    },
+                )
+
     try:
         if rt["input_compression"] and _should_transform_json_request(path, request.method, request.headers, body_bytes):
             payload = json.loads(body_bytes.decode("utf-8"))
@@ -687,6 +785,33 @@ async def proxy(path: str, request: Request) -> Response:
                 m = payload.get("model")
                 if isinstance(m, str):
                     request_model = m
+
+            # POLICY ROUTER: per-(model, endpoint) overrides for compression
+            # knobs. Only applied when MIDDLEOUT_POLICIES configured a real
+            # ruleset — an empty router with a vanilla default is a no-op so
+            # operators who never set a policy keep their runtime-toggle behavior.
+            if policy_router.rules or policy_router.default != CompressionPolicy():
+                resolved = policy_router.resolve(
+                    model=request_model, endpoint=path
+                )
+                rt["input_compression"] = resolved.input_compression
+                rt["output_compression"] = resolved.output_compression
+                rt["jl_dedupe"] = resolved.jl_dedupe
+                rt["caveman"] = {
+                    "enabled": resolved.caveman_enabled,
+                    "level": resolved.caveman_level,
+                }
+                rt["rtk"] = {
+                    "enabled": resolved.rtk_enabled,
+                    "level": resolved.rtk_level,
+                }
+                # If policy turned off input_compression mid-flight, we still
+                # captured request_model above. Short-circuit the rest of the
+                # compression pipeline by jumping into _AdaptiveSkip semantics.
+                if not rt["input_compression"]:
+                    outgoing_content = body_bytes
+                    cache_lookup_payload = payload
+                    raise _AdaptiveSkip()
 
             # Phase 1: LLMLingua-2 on the volatile tail, gated by the cache wall.
             # This runs BEFORE the legacy middle-out engines so they see the

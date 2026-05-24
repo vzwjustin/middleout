@@ -327,9 +327,18 @@ class AuditLogger:
                 "response_compression": response_summary,
                 "error": error,
             }
-            with self._lock:
+            # FIX F (bug-hunter): serialize OUTSIDE the stats lock and rely on
+            # POSIX append-atomicity for small lines (<PIPE_BUF, typically 4 KiB).
+            # The prior code held _lock through disk I/O, which serialized every
+            # request audit behind any other request's fsync. Now the lock only
+            # protects in-memory counters; concurrent record() calls all append
+            # to the file simultaneously.
+            line = json.dumps(entry, ensure_ascii=False) + "\n"
+            try:
                 with self._log_path.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                    f.write(line)
+            except OSError:
+                pass  # never fail the request because audit disk write failed
 
         if getattr(self.settings, "log_json", False):
             structured = {

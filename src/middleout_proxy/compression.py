@@ -87,7 +87,7 @@ def middle_out_text(
         "original_chars={original}; sha256={digest}; not reversible by the model ...]\n\n"
     )
 
-    # Initial marker estimate; then recompute once after budget is known.
+    # Initial marker estimate; then stabilize the marker length below.
     marker = marker_template.format(omitted=len(text) - max_chars, original=len(text), digest=digest)
     budget = max(128, max_chars - len(marker))
     head_chars = max(64, int(budget * head_fraction))
@@ -95,11 +95,21 @@ def middle_out_text(
     if head_chars + tail_chars >= len(text) - min_omission_chars:
         return text
 
-    omitted = len(text) - head_chars - tail_chars
-    marker = marker_template.format(omitted=omitted, original=len(text), digest=digest)
-    budget = max(128, max_chars - len(marker))
-    head_chars = max(64, int(budget * head_fraction))
-    tail_chars = max(64, budget - head_chars)
+    # FIX H (bug-hunter): marker length can flip a digit when `omitted` changes,
+    # which shifts the budget which shifts head/tail which shifts the real
+    # omitted count again. Iterate to a fixed point (max 3 rounds in practice)
+    # so the audit's `omitted` value in the marker actually matches the chars
+    # we're omitting.
+    for _ in range(3):
+        omitted = len(text) - head_chars - tail_chars
+        new_marker = marker_template.format(omitted=omitted, original=len(text), digest=digest)
+        if len(new_marker) == len(marker):
+            marker = new_marker
+            break
+        marker = new_marker
+        budget = max(128, max_chars - len(marker))
+        head_chars = max(64, int(budget * head_fraction))
+        tail_chars = max(64, budget - head_chars)
 
     return text[:head_chars].rstrip() + marker + text[-tail_chars:].lstrip()
 

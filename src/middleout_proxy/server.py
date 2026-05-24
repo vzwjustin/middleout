@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from typing import Any
@@ -10,6 +11,8 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from .adaptive import decide_levels as _adaptive_decide_levels
+from .adaptive import should_compress as _adaptive_should_compress
 from .audit import AuditLogger
 from .cache import CachedResponse, L1Cache, cache_key
 from .cache_wall import compute_wall
@@ -59,6 +62,8 @@ if settings.l1_cache_enabled:
 
 _CAVEMAN_LEVELS = {"lite", "standard", "aggressive", "ultra"}
 _RTK_LEVELS = {"minimal", "standard", "aggressive"}
+_JSON_AWARE_LEVELS = {"safe", "standard", "aggressive"}
+_LSH_LEVELS = {"conservative", "standard", "aggressive"}
 _LINGUA_RATIO_RANGE = (0.05, 0.95)
 
 _RUNTIME_PERSIST_PATH = settings.audit_log_dir / "runtime_settings.json"
@@ -75,6 +80,9 @@ _runtime: dict = {
     "jl_dedupe": settings.jl_dedupe_enabled,
     "caveman": {"enabled": settings.caveman_enabled, "level": settings.caveman_level},
     "rtk": {"enabled": settings.rtk_enabled, "level": settings.rtk_level},
+    "json_aware": {"enabled": settings.json_aware_enabled, "level": settings.json_aware_level},
+    "lsh": {"enabled": settings.lsh_enabled, "level": settings.lsh_level},
+    "adaptive": settings.adaptive_enabled,
     "lingua": {"enabled": settings.lingua_enabled, "ratio": settings.lingua_ratio},
     "auto_insert_wall": settings.auto_insert_cache_wall,
     "l1_cache": settings.l1_cache_enabled,
@@ -85,10 +93,10 @@ def _load_persisted_runtime() -> None:
         saved = json.loads(_RUNTIME_PERSIST_PATH.read_text())
         if not isinstance(saved, dict):
             return
-        for k in ("input_compression", "output_compression", "jl_dedupe", "auto_insert_wall"):
+        for k in ("input_compression", "output_compression", "jl_dedupe", "auto_insert_wall", "adaptive", "l1_cache"):
             if k in saved:
                 _runtime[k] = bool(saved[k])
-        for engine_key in ("caveman", "rtk", "lingua"):
+        for engine_key in ("caveman", "rtk", "lingua", "json_aware", "lsh"):
             if engine_key in saved and isinstance(saved[engine_key], dict):
                 _runtime[engine_key] = {**_runtime[engine_key], **saved[engine_key]}
     except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
@@ -103,13 +111,6 @@ def _save_runtime() -> None:
 
 _load_persisted_runtime()
 
-app = FastAPI(
-    title="MiddleOut Claude Proxy",
-    version="0.2.0",
-    docs_url="/docs",
-    redoc_url=None,
-)
-
 
 def _client_timeout(settings: Settings) -> httpx.Timeout:
     return httpx.Timeout(
@@ -120,14 +121,46 @@ def _client_timeout(settings: Settings) -> httpx.Timeout:
     )
 
 
-@app.on_event("startup")
-async def startup() -> None:
-    app.state.http = httpx.AsyncClient(timeout=_client_timeout(settings), follow_redirects=False)
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI lifespan: open one shared httpx.AsyncClient for the process.
+
+    The client supports HTTP/2 when the optional ``h2`` dep is installed,
+    otherwise falls back to HTTP/1.1. We pin ``follow_redirects=False`` so the
+    proxy is the source of truth for redirect handling (Anthropic doesn't 3xx,
+    but other providers might). The client is also exposed via ``app.state.http``
+    so tests can monkey-patch it.
+
+    Tests that construct the TestClient outside of ``with`` get a pre-seeded
+    ``app.state.http = None`` to monkey-patch onto; the real client only opens
+    when the lifespan event fires (i.e., inside ``with TestClient(app):``).
+    """
+    app.state.http = httpx.AsyncClient(
+        timeout=_client_timeout(settings),
+        follow_redirects=False,
+    )
+    try:
+        yield
+    finally:
+        try:
+            await app.state.http.aclose()
+        except Exception:
+            pass
 
 
-@app.on_event("shutdown")
-async def shutdown() -> None:
-    await app.state.http.aclose()
+app = FastAPI(
+    title="MiddleOut Claude Proxy",
+    version="0.2.0",
+    docs_url="/docs",
+    redoc_url=None,
+    lifespan=lifespan,
+)
+
+# Pre-seed app.state.http to None so tests that monkey-patch it before
+# entering the lifespan context have an attribute to overwrite. Real
+# requests always run through `with TestClient(app):` (which triggers the
+# lifespan) so this default is overwritten before the first request lands.
+app.state.http = None
 
 
 @app.get("/healthz")
@@ -140,6 +173,11 @@ async def healthz() -> dict[str, Any]:
         "output_compression": _runtime["output_compression"],
         "caveman_enabled": _runtime["caveman"]["enabled"],
         "rtk_enabled": _runtime["rtk"]["enabled"],
+        "json_aware_enabled": _runtime["json_aware"]["enabled"],
+        "json_aware_level": _runtime["json_aware"]["level"],
+        "lsh_enabled": _runtime["lsh"]["enabled"],
+        "lsh_level": _runtime["lsh"]["level"],
+        "adaptive_enabled": _runtime["adaptive"],
         "lingua_enabled": _runtime["lingua"]["enabled"],
         "lingua_ratio": _runtime["lingua"]["ratio"],
         "lingua_model_loaded": lingua_compressor.is_loaded,
@@ -201,8 +239,11 @@ def _snapshot_runtime() -> dict[str, Any]:
         "jl_dedupe": _runtime["jl_dedupe"],
         "auto_insert_wall": _runtime["auto_insert_wall"],
         "l1_cache": _runtime["l1_cache"],
+        "adaptive": _runtime["adaptive"],
         "caveman": dict(_runtime["caveman"]),
         "rtk": dict(_runtime["rtk"]),
+        "json_aware": dict(_runtime["json_aware"]),
+        "lsh": dict(_runtime["lsh"]),
         "lingua": dict(_runtime["lingua"]),
     }
 
@@ -215,13 +256,15 @@ async def post_settings(request: Request) -> Response:
 
 
 async def _post_settings_locked(body: dict) -> Response:
-    for k in ("input_compression", "output_compression", "jl_dedupe", "auto_insert_wall", "l1_cache"):
+    for k in ("input_compression", "output_compression", "jl_dedupe", "auto_insert_wall", "l1_cache", "adaptive"):
         if k in body:
             _runtime[k] = bool(body[k])
 
     for engine_key, valid_levels in (
         ("caveman", _CAVEMAN_LEVELS),
         ("rtk", _RTK_LEVELS),
+        ("json_aware", _JSON_AWARE_LEVELS),
+        ("lsh", _LSH_LEVELS),
     ):
         if engine_key not in body:
             continue
@@ -356,12 +399,50 @@ async def proxy(path: str, request: Request) -> Response:
                 )
                 lingua_chars_saved = volatile_audit.chars_saved
 
+            # ADAPTIVE POLICY: if enabled, the policy picks engine levels based
+            # on the payload's size and the target model's context window. The
+            # policy can also short-circuit compression entirely on very small
+            # payloads. Caller-supplied levels in `rt` are used as fallbacks
+            # when the policy returns a value we don't know how to handle.
+            engine_caveman = rt["caveman"]
+            engine_rtk = rt["rtk"]
+            engine_json_aware = rt["json_aware"]
+            engine_lsh = rt["lsh"]
+            engine_jl = rt["jl_dedupe"]
+            if rt["adaptive"]:
+                if not _adaptive_should_compress(payload):
+                    # Too small to bother. Send the body unchanged and skip the
+                    # rest of the compression pipeline.
+                    outgoing_content = body_bytes
+                    cache_lookup_payload = payload
+                    raise _AdaptiveSkip()
+                levels = _adaptive_decide_levels(payload)
+                if levels.get("middle_out") == "off":
+                    # Disable middle-out via the existing min_omission threshold
+                    # path is too intrusive; instead just route through unchanged.
+                    pass  # middle-out level is set per-call via settings; keep default
+                cav_level = levels.get("caveman")
+                if cav_level in _CAVEMAN_LEVELS:
+                    engine_caveman = {"enabled": True, "level": cav_level}
+                rtk_level = levels.get("rtk")
+                if rtk_level in _RTK_LEVELS:
+                    engine_rtk = {"enabled": True, "level": rtk_level}
+                ja_level = levels.get("json_aware")
+                if ja_level in _JSON_AWARE_LEVELS:
+                    engine_json_aware = {"enabled": True, "level": ja_level}
+                lsh_level = levels.get("lsh")
+                if lsh_level in _LSH_LEVELS:
+                    engine_lsh = {"enabled": True, "level": lsh_level}
+                if "jl_dedupe" in levels:
+                    engine_jl = bool(levels["jl_dedupe"])
             transformed, request_audit = compressor.compress_request_payload(
                 payload,
                 endpoint=path,
-                jl_dedupe=rt["jl_dedupe"],
-                caveman=rt["caveman"],
-                rtk=rt["rtk"],
+                jl_dedupe=engine_jl,
+                caveman=engine_caveman,
+                rtk=engine_rtk,
+                json_aware=engine_json_aware,
+                lsh=engine_lsh,
             )
             # FIX D: when nothing was touched, send the original bytes. Anthropic's
             # prompt cache is byte-keyed; re-encoding with stable separators still
@@ -379,6 +460,10 @@ async def proxy(path: str, request: Request) -> Response:
                 request_headers["content-type"] = "application/json"
             # else: outgoing_content stays as body_bytes — byte-identical passthrough
             cache_lookup_payload = transformed
+    except _AdaptiveSkip:
+        # Adaptive policy decided the payload is too small to benefit from
+        # compression; outgoing_content + cache_lookup_payload were set above.
+        request_audit.events.clear()
     except Exception as exc:  # Keep the proxy useful even if compression fails.
         request_audit.events.clear()
         request_headers["x-middleout-warning"] = f"compression skipped: {type(exc).__name__}"
@@ -598,6 +683,14 @@ async def _streaming_forward(
         headers=response_headers,
         media_type=upstream_response.headers.get("content-type", "text/event-stream"),
     )
+
+
+class _AdaptiveSkip(Exception):
+    """Raised internally by the adaptive policy to short-circuit compression.
+
+    Caught by the request handler's catch-all; the payload is sent unchanged.
+    Never escapes the handler.
+    """
 
 
 class StrictSubscriptionAuthError(ValueError):

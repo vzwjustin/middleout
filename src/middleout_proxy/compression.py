@@ -252,6 +252,8 @@ class PayloadCompressor:
         jl_dedupe: bool | None = None,
         caveman: dict | None = None,
         rtk: dict | None = None,
+        json_aware: dict | None = None,
+        lsh: dict | None = None,
     ) -> tuple[dict[str, Any], CompressionAudit]:
         audit = CompressionAudit(endpoint=endpoint)
         if not self.settings.input_compression_enabled:
@@ -277,6 +279,29 @@ class PayloadCompressor:
             self._rtk_active = {
                 "enabled": bool(rtk.get("enabled", self.settings.rtk_enabled)),
                 "level": str(rtk.get("level", self.settings.rtk_level)),
+            }
+        # json_aware: per-text-block JSON minify + whitespace coalesce.
+        # Defaults are conservative: off, "safe" level.
+        if json_aware is None:
+            self._json_aware_active = {
+                "enabled": getattr(self.settings, "json_aware_enabled", False),
+                "level": getattr(self.settings, "json_aware_level", "safe"),
+            }
+        else:
+            self._json_aware_active = {
+                "enabled": bool(json_aware.get("enabled", False)),
+                "level": str(json_aware.get("level", "safe")),
+            }
+        # lsh: cross-block near-duplicate dedupe inside each message's content list.
+        if lsh is None:
+            self._lsh_active = {
+                "enabled": getattr(self.settings, "lsh_enabled", False),
+                "level": getattr(self.settings, "lsh_level", "standard"),
+            }
+        else:
+            self._lsh_active = {
+                "enabled": bool(lsh.get("enabled", False)),
+                "level": str(lsh.get("level", "standard")),
             }
         working = copy.deepcopy(payload)
         sketch_index = RequestSketchIndex(
@@ -363,6 +388,49 @@ class PayloadCompressor:
 
         if not isinstance(value, list):
             return value
+
+        # LSH PRE-PASS: cross-block near-duplicate dedupe within this list.
+        # Runs BEFORE per-block compression so the rest of the pipeline sees
+        # the already-deduped list. Protected blocks are excluded from
+        # replacement but still participate as match targets.
+        lsh_cfg = getattr(self, "_lsh_active", None) or {"enabled": False, "level": "standard"}
+        if lsh_cfg.get("enabled") and value:
+            try:
+                from .lsh_dedupe import dedupe_blocks as _lsh_dedupe
+                protected_idx = {
+                    i for i in range(len(value))
+                    if _is_block_protected(
+                        self._protection, kind=kind, msg_idx=msg_idx, block_idx=i
+                    )
+                }
+                new_value, stats = _lsh_dedupe(
+                    value, level=lsh_cfg.get("level", "standard"), protected=protected_idx
+                )
+                if stats.get("replaced", 0) > 0:
+                    # Reassign value to the deduped list and emit one audit event
+                    # per replacement for the dashboard. The original lengths
+                    # are recoverable from the marker strings.
+                    for i, (old, new) in enumerate(zip(value, new_value)):
+                        if old != new:
+                            old_text = old.get("text") if isinstance(old, dict) else None
+                            new_text = new.get("text") if isinstance(new, dict) else None
+                            if not isinstance(old_text, str):
+                                old_text = ""
+                            if not isinstance(new_text, str):
+                                new_text = ""
+                            audit.events.append(
+                                self._event(
+                                    path=f"{path}[{i}]",
+                                    mode="lsh-near-duplicate",
+                                    original=old_text,
+                                    compressed=new_text,
+                                    digest=sha256_short(old_text),
+                                    note=f"level={lsh_cfg.get('level', 'standard')}",
+                                )
+                            )
+                    value = new_value
+            except (ImportError, ValueError):
+                pass
 
         for i, block in enumerate(value):
             block_path = f"{path}[{i}]"
@@ -463,6 +531,10 @@ class PayloadCompressor:
         audit.cache_misses += 1
 
         compressed = self._compress_text(text, path=path, audit=audit, digest=original_digest)
+        # json_aware runs BEFORE the prose engines so caveman/rtk see already-
+        # minified JSON (less work, cleaner output). Cache key already includes
+        # json_aware enabled+level so cached entries don't bleed across configs.
+        compressed = self._apply_json_aware(compressed, path=path, audit=audit)
         compressed = self._apply_caveman(compressed, path=path, audit=audit)
         compressed = self._apply_rtk(compressed, path=path, audit=audit)
         self.result_cache.put(cache_key, compressed)
@@ -478,6 +550,7 @@ class PayloadCompressor:
             "enabled": self.settings.rtk_enabled,
             "level": self.settings.rtk_level,
         }
+        ja = getattr(self, "_json_aware_active", None) or {"enabled": False, "level": "safe"}
         parts = (
             sha256_short(text),
             str(len(text)),
@@ -488,8 +561,32 @@ class PayloadCompressor:
             str(cav.get("level", "standard")),
             "rtk1" if rtk.get("enabled") else "rtk0",
             str(rtk.get("level", "minimal")),
+            "ja1" if ja.get("enabled") else "ja0",
+            str(ja.get("level", "safe")),
         )
         return "|".join(parts)
+
+    def _apply_json_aware(self, text: str, *, path: str, audit: CompressionAudit) -> str:
+        cfg = getattr(self, "_json_aware_active", None) or {"enabled": False, "level": "safe"}
+        if not cfg.get("enabled"):
+            return text
+        try:
+            from .json_aware import compress as _ja_compress
+            out, _stats = _ja_compress(text, level=cfg.get("level", "safe"))
+        except (ValueError, ImportError):
+            return text
+        if out != text:
+            audit.events.append(
+                self._event(
+                    path=path,
+                    mode="json-aware",
+                    original=text,
+                    compressed=out,
+                    digest=sha256_short(text),
+                    note=f"level={cfg.get('level', 'safe')}",
+                )
+            )
+        return out
 
     def _apply_caveman(self, text: str, *, path: str, audit: CompressionAudit) -> str:
         cfg = getattr(self, "_caveman_active", None) or {

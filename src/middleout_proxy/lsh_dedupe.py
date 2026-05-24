@@ -17,6 +17,20 @@ Levels:
 
 `protected` is a set of block indices that must be left untouched. They still
 contribute to the index so later candidates can match against them.
+
+Shingling
+---------
+We use a hybrid shingling strategy:
+
+1. Primary: word-k-shingles via :func:`jl.tokenize` (k=5). Good for natural
+   language and code blocks where word boundaries are meaningful.
+2. Fallback: character k-shingles (k=8) when the token shingle count is < 16.
+   Catches degenerate inputs like "first block: " + "x" * 500 (one giant
+   identifier token) where word shingles collapse to ~1 entry and yield
+   misleadingly-low Jaccard for near-duplicates.
+
+The hybrid is implemented at the shingle layer so the rest of the minhash math
+(blake2b, band keys, Jaccard estimate) stays identical to the canonical form.
 """
 
 from __future__ import annotations
@@ -32,6 +46,12 @@ _LEVELS = ("conservative", "standard", "aggressive")
 
 _SIGNATURE_WIDTH = 128
 _SHINGLE_WIDTH = 5
+# Hybrid fallback: when word-shingle count is < this, switch to char shingles.
+# 16 is a balance between "still has enough variety to discriminate" (the
+# protected use-case is long natural-language docs) and "catches degenerate
+# single-token inputs". Tuned against the lsh_dedupe test suite.
+_HYBRID_FALLBACK_MIN = 16
+_CHAR_SHINGLE_WIDTH = 8
 
 _LEVEL_CONFIG = {
     "conservative": {"threshold": 0.95, "bands": 8, "rows": 16},
@@ -53,18 +73,45 @@ def _hash_token(seed_idx: int, token: str) -> int:
     return int.from_bytes(h, "big", signed=False)
 
 
-def _minhash_signature(text: str, width: int = _SIGNATURE_WIDTH) -> tuple[int, ...]:
-    """Deterministic minhash signature over k-shingles of text."""
+def _char_shingles(text: str, width: int):
+    """Yield overlapping character k-grams (k=`width`) over `text`.
+
+    Whitespace is preserved so that "abc def" and "abcdef" hash differently —
+    the surface form is what we're after for near-duplicate detection.
+    """
+    if not text:
+        return
+    if len(text) <= width:
+        yield text
+        return
+    for i in range(0, len(text) - width + 1):
+        yield text[i : i + width]
+
+
+def _collect_shingles(text: str) -> list[str]:
+    """Hybrid shingle collector. Falls back to char shingles for sparse inputs."""
     tokens = tokenize(text)
+    word_shingles = list(shingles(tokens, _SHINGLE_WIDTH))
+    if len(word_shingles) >= _HYBRID_FALLBACK_MIN:
+        return word_shingles
+    # Sparse input — use character k-grams. Prefix each char-shingle with a
+    # marker byte so char-shingles cannot collide with word-shingles (which
+    # contain whitespace separators). Defensive uniqueness, no functional impact
+    # since we never mix the two modes for one text.
+    return [f"\x01{s}" for s in _char_shingles(text, _CHAR_SHINGLE_WIDTH)]
+
+
+def _minhash_signature(text: str, width: int = _SIGNATURE_WIDTH) -> tuple[int, ...]:
+    """Deterministic minhash signature over hybrid shingles of `text`."""
     sigs = [_MAX_U64] * width
-    seen = False
-    for shingle in shingles(tokens, _SHINGLE_WIDTH):
-        seen = True
+    any_shingle = False
+    for shingle in _collect_shingles(text):
+        any_shingle = True
         for i in range(width):
             h = _hash_token(i, shingle)
             if h < sigs[i]:
                 sigs[i] = h
-    if not seen:
+    if not any_shingle:
         # Empty/very short input — return all zeros so comparisons are stable.
         return tuple([0] * width)
     return tuple(sigs)

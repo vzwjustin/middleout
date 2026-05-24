@@ -1,0 +1,1 @@
+{"input_compression": true, "output_compression": true, "jl_dedupe": true, "caveman": {"enabled": true, "level": "standard"}, "rtk": {"enabled": true, "level": "standard"}}

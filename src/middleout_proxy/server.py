@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 from typing import Any
 
@@ -9,9 +11,12 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from .audit import AuditLogger
+from .cache_wall import compute_wall
 from .compression import CompressionAudit, PayloadCompressor
 from .config import Settings, load_settings
 from .dashboard import _DASHBOARD_HTML
+from .lingua import LinguaCompressor
+from .volatile import compress_volatile_tail
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -27,14 +32,34 @@ HOP_BY_HOP_HEADERS = {
     "content-encoding",
 }
 
+# Defense in depth: even if upstream ever reflects an auth header, we don't relay it.
+RESPONSE_STRIPPED_HEADERS = {
+    "authorization",
+    "x-api-key",
+    "anthropic-api-key",
+    "proxy-authorization",
+    "set-cookie",
+}
+
 settings = load_settings()
 compressor = PayloadCompressor(settings)
 audit_logger = AuditLogger(settings)
+lingua_compressor = LinguaCompressor(
+    model_id=settings.lingua_model_id,
+    default_ratio=settings.lingua_ratio,
+)
 
 _CAVEMAN_LEVELS = {"lite", "standard", "aggressive", "ultra"}
 _RTK_LEVELS = {"minimal", "standard", "aggressive"}
+_LINGUA_RATIO_RANGE = (0.05, 0.95)
 
 _RUNTIME_PERSIST_PATH = settings.audit_log_dir / "runtime_settings.json"
+
+# Serializes POST /settings writes so in-flight requests can't observe torn
+# nested dicts (e.g., caveman.enabled flipped without level updating). Each
+# request takes a snapshot under the lock and uses the snapshot for the rest
+# of the handler.
+_runtime_lock = asyncio.Lock()
 
 _runtime: dict = {
     "input_compression": settings.input_compression_enabled,
@@ -42,18 +67,22 @@ _runtime: dict = {
     "jl_dedupe": settings.jl_dedupe_enabled,
     "caveman": {"enabled": settings.caveman_enabled, "level": settings.caveman_level},
     "rtk": {"enabled": settings.rtk_enabled, "level": settings.rtk_level},
+    "lingua": {"enabled": settings.lingua_enabled, "ratio": settings.lingua_ratio},
+    "auto_insert_wall": settings.auto_insert_cache_wall,
 }
 
 def _load_persisted_runtime() -> None:
     try:
         saved = json.loads(_RUNTIME_PERSIST_PATH.read_text())
-        for k in ("input_compression", "output_compression", "jl_dedupe"):
+        if not isinstance(saved, dict):
+            return
+        for k in ("input_compression", "output_compression", "jl_dedupe", "auto_insert_wall"):
             if k in saved:
                 _runtime[k] = bool(saved[k])
-        for engine_key in ("caveman", "rtk"):
+        for engine_key in ("caveman", "rtk", "lingua"):
             if engine_key in saved and isinstance(saved[engine_key], dict):
                 _runtime[engine_key] = {**_runtime[engine_key], **saved[engine_key]}
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
         pass
 
 def _save_runtime() -> None:
@@ -102,6 +131,10 @@ async def healthz() -> dict[str, Any]:
         "output_compression": _runtime["output_compression"],
         "caveman_enabled": _runtime["caveman"]["enabled"],
         "rtk_enabled": _runtime["rtk"]["enabled"],
+        "lingua_enabled": _runtime["lingua"]["enabled"],
+        "lingua_ratio": _runtime["lingua"]["ratio"],
+        "lingua_model_loaded": lingua_compressor.is_loaded,
+        "auto_insert_cache_wall": _runtime["auto_insert_wall"],
         "preserve_anthropic_cache": settings.preserve_anthropic_cache,
         "compression_cache_enabled": settings.compression_cache_enabled,
         "auth_mode": settings.auth_mode,
@@ -124,10 +157,32 @@ async def get_settings() -> dict[str, Any]:
     return dict(_runtime)
 
 
+def _snapshot_runtime() -> dict[str, Any]:
+    """Take a coherent snapshot of `_runtime` for one request to use throughout.
+
+    Cheap dict-of-dicts deep copy — engine settings are tiny so this is well
+    under a microsecond. Callers don't hold the lock past the snapshot.
+    """
+    return {
+        "input_compression": _runtime["input_compression"],
+        "output_compression": _runtime["output_compression"],
+        "jl_dedupe": _runtime["jl_dedupe"],
+        "auto_insert_wall": _runtime["auto_insert_wall"],
+        "caveman": dict(_runtime["caveman"]),
+        "rtk": dict(_runtime["rtk"]),
+        "lingua": dict(_runtime["lingua"]),
+    }
+
+
 @app.post("/settings")
 async def post_settings(request: Request) -> Response:
     body = await request.json()
-    for k in ("input_compression", "output_compression", "jl_dedupe"):
+    async with _runtime_lock:
+        return await _post_settings_locked(body)
+
+
+async def _post_settings_locked(body: dict) -> Response:
+    for k in ("input_compression", "output_compression", "jl_dedupe", "auto_insert_wall"):
         if k in body:
             _runtime[k] = bool(body[k])
 
@@ -158,6 +213,33 @@ async def post_settings(request: Request) -> Response:
                 )
             current["level"] = level
         _runtime[engine_key] = current
+
+    if "lingua" in body:
+        incoming = body["lingua"]
+        if not isinstance(incoming, dict):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "lingua must be an object"},
+            )
+        current = dict(_runtime["lingua"])
+        if "enabled" in incoming:
+            current["enabled"] = bool(incoming["enabled"])
+        if "ratio" in incoming:
+            try:
+                ratio = float(incoming["ratio"])
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "lingua.ratio must be a float"},
+                )
+            lo, hi = _LINGUA_RATIO_RANGE
+            if not lo <= ratio <= hi:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"lingua.ratio must be in [{lo}, {hi}], got {ratio}"},
+                )
+            current["ratio"] = ratio
+        _runtime["lingua"] = current
 
     _save_runtime()
     return JSONResponse(content=dict(_runtime))
@@ -204,25 +286,65 @@ async def proxy(path: str, request: Request) -> Response:
     body_bytes = await request.body()
     request_audit = CompressionAudit(endpoint=path)
     outgoing_content: bytes | None = body_bytes if body_bytes else None
+    wall_auto_inserted = False
+    lingua_chars_saved = 0
+
+    # FIX A: snapshot _runtime once under the lock. All subsequent reads in
+    # this handler use the snapshot, so a concurrent POST /settings cannot
+    # tear a nested dict mid-compression.
+    async with _runtime_lock:
+        rt = _snapshot_runtime()
 
     try:
-        if _runtime["input_compression"] and _should_transform_json_request(path, request.method, request.headers, body_bytes):
+        if rt["input_compression"] and _should_transform_json_request(path, request.method, request.headers, body_bytes):
             payload = json.loads(body_bytes.decode("utf-8"))
+
+            # Phase 1: LLMLingua-2 on the volatile tail, gated by the cache wall.
+            # This runs BEFORE the legacy middle-out engines so they see the
+            # already-shrunk tail. Both layers honor cache_control.
+            lingua_cfg = rt["lingua"]
+            if lingua_cfg["enabled"]:
+                wall = compute_wall(
+                    payload, auto_insert=bool(rt["auto_insert_wall"])
+                )
+                wall_auto_inserted = wall.auto_inserted
+                payload, volatile_audit = compress_volatile_tail(
+                    payload,
+                    wall=wall,
+                    lingua=lingua_compressor,
+                    ratio=lingua_cfg["ratio"],
+                    deepcopy_payload=False,  # already a fresh json.loads copy
+                )
+                lingua_chars_saved = volatile_audit.chars_saved
+
             transformed, request_audit = compressor.compress_request_payload(
                 payload,
                 endpoint=path,
-                jl_dedupe=_runtime["jl_dedupe"],
-                caveman=_runtime["caveman"],
-                rtk=_runtime["rtk"],
+                jl_dedupe=rt["jl_dedupe"],
+                caveman=rt["caveman"],
+                rtk=rt["rtk"],
             )
-            outgoing_content = json.dumps(transformed, separators=(",", ":"), ensure_ascii=False).encode(
-                "utf-8"
+            # FIX D: when nothing was touched, send the original bytes. Anthropic's
+            # prompt cache is byte-keyed; re-encoding with stable separators still
+            # produces different bytes than the client's encoder (key order,
+            # spaces, escaping) and would invalidate the upstream cache.
+            any_change = (
+                request_audit.touched
+                or lingua_chars_saved > 0
+                or wall_auto_inserted
             )
-            request_headers["content-type"] = "application/json"
+            if any_change:
+                outgoing_content = json.dumps(
+                    transformed, separators=(",", ":"), ensure_ascii=False
+                ).encode("utf-8")
+                request_headers["content-type"] = "application/json"
+            # else: outgoing_content stays as body_bytes — byte-identical passthrough
     except Exception as exc:  # Keep the proxy useful even if compression fails.
         request_audit.events.clear()
         request_headers["x-middleout-warning"] = f"compression skipped: {type(exc).__name__}"
         outgoing_content = body_bytes if body_bytes else None
+        lingua_chars_saved = 0
+        wall_auto_inserted = False
 
     method = request.method.upper()
     try:
@@ -234,6 +356,8 @@ async def proxy(path: str, request: Request) -> Response:
                 content=outgoing_content,
                 request_audit=request_audit,
                 path=path,
+                lingua_chars_saved=lingua_chars_saved,
+                wall_auto_inserted=wall_auto_inserted,
             )
 
         upstream_response = await app.state.http.request(
@@ -241,10 +365,16 @@ async def proxy(path: str, request: Request) -> Response:
         )
         response_headers = _forward_response_headers(upstream_response.headers)
         response_headers.update(_compression_headers(request_audit, prefix="input"))
+        response_headers.update(
+            _brain_headers(
+                lingua_chars_saved=lingua_chars_saved,
+                wall_auto_inserted=wall_auto_inserted,
+            )
+        )
 
         response_content = upstream_response.content
         response_audit: CompressionAudit | None = None
-        if _runtime["output_compression"] and _should_transform_json_response(path, upstream_response.headers, response_content):
+        if rt["output_compression"] and _should_transform_json_response(path, upstream_response.headers, response_content):
             try:
                 response_payload = upstream_response.json()
                 transformed_response, response_audit = compressor.compress_response_payload(
@@ -302,11 +432,25 @@ async def _streaming_forward(
     content: bytes | None,
     request_audit: CompressionAudit,
     path: str,
+    lingua_chars_saved: int = 0,
+    wall_auto_inserted: bool = False,
 ) -> StreamingResponse:
+    # FIX B: pin accept-encoding to identity for streaming. httpx otherwise
+    # injects "gzip, deflate, br" by default; if upstream returns a non-SSE
+    # gzipped error body (auth failure, 5xx), `aiter_raw()` would yield raw
+    # gzip bytes that the SSE client can't decode.
+    headers = dict(headers)
+    headers["accept-encoding"] = "identity"
     req = app.state.http.build_request(method, upstream_url, headers=headers, content=content)
     upstream_response = await app.state.http.send(req, stream=True)
     response_headers = _forward_response_headers(upstream_response.headers)
     response_headers.update(_compression_headers(request_audit, prefix="input"))
+    response_headers.update(
+        _brain_headers(
+            lingua_chars_saved=lingua_chars_saved,
+            wall_auto_inserted=wall_auto_inserted,
+        )
+    )
 
     async def body_iter():
         try:
@@ -365,6 +509,14 @@ def _forward_request_headers(headers: Any, settings: Settings) -> dict[str, str]
             "ANTHROPIC_BASE_URL=http://127.0.0.1:8787 after logging in with /login, and make sure "
             "ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN are unset in the Claude Code shell."
         )
+    # OAuth bearer tokens per RFC 6750 never contain commas. A comma-folded
+    # Authorization value like `Bearer good, ApiKey sk-...` would otherwise pass
+    # the startswith check above — reject it.
+    if "," in authorization:
+        raise StrictSubscriptionAuthError(
+            "Authorization header contains a comma; comma-folded credentials "
+            "are rejected to prevent smuggling API keys past the Bearer check."
+        )
 
     if "anthropic-version" not in forwarded:
         forwarded["anthropic-version"] = settings.default_anthropic_version
@@ -379,6 +531,10 @@ def _forward_response_headers(headers: Any) -> dict[str, str]:
         lower = key.lower()
         if lower in HOP_BY_HOP_HEADERS:
             continue
+        # Defense in depth: never echo auth-leaking headers from upstream back
+        # to the client, even if Anthropic ever reflects them in an error body.
+        if lower in RESPONSE_STRIPPED_HEADERS:
+            continue
         # We may alter body bytes, so content-length is intentionally omitted above.
         forwarded[lower] = value
     return forwarded
@@ -391,6 +547,15 @@ def _compression_headers(audit: CompressionAudit, *, prefix: str) -> dict[str, s
     }
 
 
+def _brain_headers(*, lingua_chars_saved: int, wall_auto_inserted: bool) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if lingua_chars_saved > 0:
+        out["x-brain-lingua-chars-saved"] = str(lingua_chars_saved)
+    if wall_auto_inserted:
+        out["x-brain-wall-inserted"] = "1"
+    return out
+
+
 def _should_transform_json_request(path: str, method: str, headers: Any, body: bytes) -> bool:
     if method.upper() != "POST" or not body:
         return False
@@ -398,7 +563,10 @@ def _should_transform_json_request(path: str, method: str, headers: Any, body: b
     if normalized not in {"v1/messages", "v1/messages/count_tokens"}:
         return False
     content_type = headers.get("content-type", "")
-    return "application/json" in content_type.lower() or body[:1] in {b"{", b"["}
+    if "application/json" in content_type.lower():
+        return True
+    # Body may start with whitespace before the opening brace; lstrip catches that.
+    return body.lstrip()[:1] in {b"{", b"["}
 
 
 def _should_transform_json_response(path: str, headers: Any, body: bytes) -> bool:

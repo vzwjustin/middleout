@@ -6,11 +6,21 @@ from pathlib import Path
 
 
 BLOCKED_AUTH_ENV_VARS = (
+    # Anthropic-native API-key / token env vars.
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BEARER_TOKEN",
+    # Proxy-side overrides that would force API-key mode.
     "PROXY_ANTHROPIC_API_KEY",
     "PROXY_AUTH_MODE",
     "PROXY_FORCE_API_KEY",
+    # Claude Code helper hooks / Bedrock / Vertex switches.
+    "CLAUDE_CODE_API_KEY_HELPER",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "AWS_BEDROCK_API_KEY",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "VERTEX_API_KEY",
 )
 
 
@@ -85,6 +95,19 @@ class Settings:
     # cache_control marker (mutating them would invalidate the upstream cache).
     preserve_anthropic_cache: bool = _bool_env("MIDDLEOUT_PRESERVE_ANTHROPIC_CACHE", True)
 
+    # LLMLingua-2: cache-aware compression of the volatile tail. Opt-in; needs
+    # the [lingua] install extra and downloads a ~200MB BERT model on first use.
+    lingua_enabled: bool = _bool_env("BRAIN_LINGUA_ENABLED", False)
+    lingua_ratio: float = _float_env("BRAIN_LINGUA_RATIO", 0.5)
+    lingua_model_id: str = os.getenv(
+        "BRAIN_LINGUA_MODEL",
+        "microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank",
+    )
+    # When the incoming request has NO cache_control marker, the proxy can stamp
+    # one after [system][tools] so the prefix becomes cacheable upstream. The
+    # mutation is documented in the response header `x-brain-wall-inserted`.
+    auto_insert_cache_wall: bool = _bool_env("BRAIN_AUTO_INSERT_WALL", True)
+
     # Local LRU cache for deterministic post-JL compression output. Independent of
     # Anthropic's native cache; only avoids local CPU work on repeated text.
     compression_cache_enabled: bool = _bool_env("MIDDLEOUT_COMPRESSION_CACHE", True)
@@ -106,7 +129,20 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    blocked = [name for name in BLOCKED_AUTH_ENV_VARS if os.getenv(name)]
+    # `is not None` catches empty-string env vars too. An empty string is still
+    # an explicit user intent to *set* the variable, even if downstream code
+    # treats it as unset; we refuse to start in either case.
+    # The .upper() comparison defends against POSIX case-sensitive env on macOS/Linux
+    # where a user might set `anthropic_api_key=...` and slip through an exact-case lookup.
+    blocked = []
+    for env_name in os.environ:
+        if env_name.upper() in BLOCKED_AUTH_ENV_VARS and os.environ.get(env_name) is not None:
+            blocked.append(env_name)
+    # Also check exact-case matches even if not in os.environ (defensive — handles
+    # any future code path that explicitly sets one of these names with empty value).
+    for name in BLOCKED_AUTH_ENV_VARS:
+        if name not in blocked and os.getenv(name) is not None:
+            blocked.append(name)
     if blocked:
         names = ", ".join(blocked)
         raise ValueError(
@@ -133,4 +169,6 @@ def load_settings() -> Settings:
         )
     if settings.compression_cache_size < 0:
         raise ValueError("MIDDLEOUT_COMPRESSION_CACHE_SIZE must be >= 0")
+    if not 0.05 <= settings.lingua_ratio <= 0.95:
+        raise ValueError("BRAIN_LINGUA_RATIO must be between 0.05 and 0.95")
     return settings

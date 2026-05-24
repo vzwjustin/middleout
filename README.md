@@ -265,11 +265,31 @@ currently round-trips end-to-end. Non-Anthropic hints respond `501`.
 ## Files
 
 ```text
-src/middleout_proxy/server.py       FastAPI gateway and streaming pass-through
-src/middleout_proxy/compression.py  request/response compaction
-src/middleout_proxy/jl.py           JL-style sign projection sketches
-src/middleout_proxy/config.py       environment config and strict auth guardrails
-src/middleout_proxy/audit.py        JSONL audit stats
+src/middleout_proxy/
+  server.py            FastAPI gateway, lifespan, streaming pass-through, all routes
+  compression.py       request/response compaction (middle-out + JL + engines)
+  jl.py                JL-style sign projection sketches
+  cache_wall.py        Anthropic cache_control parser (the cache wall)
+  volatile.py          compresses the volatile tail right of the wall
+  lingua.py            LLMLingua-2 wrapper (opt-in)
+  config.py            TOML + env + defaults; strict auth guardrails
+  audit.py             JSONL audit + rolling timeseries
+  dashboard.py         single-page HTML dashboard
+  preview.py           /preview endpoint helpers
+  metrics.py           Prometheus-format renderer
+  policies.py          per-model/per-endpoint policy router
+  adaptive.py          context-pressure level decider
+  rate_limit.py        backoff + queue helpers
+  budget.py            char/token cap tracker
+  cost.py              price table + CostTracker
+  preview.py           dry-run sizing
+  providers/           adapter package (anthropic/openai/google/ollama)
+  cache/               L1 (SQLite), L2 (in-memory or Qdrant), normalization
+  engines/             secondary compression engines (caveman, rtk, ...)
+  sim/                 MinHash / SimHash similarity primitives
+tests/                 680+ pytest cases, runs in <3s
+benchmarks/            offline compression-ratio benchmarks
+docs/                  design notes
 ```
 
 ## Caveats

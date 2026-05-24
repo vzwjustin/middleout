@@ -177,7 +177,7 @@ def test_structured_logging_emits_json_line_on_stderr():
     assert len(lines) == 1
     rec = json.loads(lines[0])
     assert set(rec.keys()) == {
-        "ts","method","path","status","ms",
+        "ts","method","path","status","ms","model",
         "chars_saved_input","chars_saved_output","engines_active","request_id",
     }
     assert rec["method"] == "POST"
@@ -188,6 +188,8 @@ def test_structured_logging_emits_json_line_on_stderr():
     assert rec["chars_saved_output"] == 0
     assert rec["engines_active"] == ["middle-out"]
     assert rec["request_id"] == "req_test_123"
+    # model was not passed; should serialize as None.
+    assert rec["model"] is None
     from datetime import datetime
     datetime.fromisoformat(rec["ts"])
 

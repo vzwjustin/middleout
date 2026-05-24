@@ -20,6 +20,40 @@ def _scrub_blocked_auth_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _reset_server_runtime() -> "object":
+    """Snapshot+restore server._runtime around every test.
+
+    Without this, a test that flips a runtime flag via POST /settings
+    (e.g. enabling l1_cache or l2_cache) leaks state into the next test
+    and causes order-dependent flakes. The fixture is best-effort: if
+    server.py hasn't been imported yet we no-op.
+    """
+    try:
+        from middleout_proxy import server as _srv
+    except Exception:
+        yield
+        return
+    snapshot = dict(_srv._runtime)
+    # Snapshot the L2 enabled bit too -- the POST /settings handler mirrors
+    # the runtime flag onto l2_cache.enabled directly.
+    l2_enabled_snapshot: bool | None = None
+    try:
+        l2_enabled_snapshot = bool(_srv.l2_cache.enabled)
+    except Exception:
+        l2_enabled_snapshot = None
+    try:
+        yield
+    finally:
+        _srv._runtime.clear()
+        _srv._runtime.update(snapshot)
+        if l2_enabled_snapshot is not None:
+            try:
+                _srv.l2_cache.enabled = l2_enabled_snapshot
+            except Exception:
+                pass
+
+
 @pytest.fixture
 def default_settings() -> Settings:
     """Fresh `Settings()` instance with defaults."""

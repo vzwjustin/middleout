@@ -144,6 +144,7 @@ class ProxyStats:
         is_error: bool,
         request_audit_summary: dict[str, Any] | None = None,
         response_audit_summary: dict[str, Any] | None = None,
+        model: str | None = None,
         now: float | None = None,
     ) -> None:
         ts = time.time() if now is None else now
@@ -194,6 +195,7 @@ class ProxyStats:
                 "engines": dict(engines),
                 "request_id": request_id,
                 "is_error": bool(is_error),
+                "model": model,
                 "request_audit": _sanitize_audit_summary(request_audit_summary),
                 "response_audit": _sanitize_audit_summary(response_audit_summary),
             }
@@ -272,6 +274,7 @@ class AuditLogger:
         latency_ms: float | None = None,
         bytes_in: int = 0,
         bytes_out: int = 0,
+        model: str | None = None,
         now: float | None = None,
     ) -> None:
         chars_saved_in = request_audit.chars_saved if request_audit else 0
@@ -310,6 +313,7 @@ class AuditLogger:
                 is_error=is_error,
                 request_audit_summary=request_summary,
                 response_audit_summary=response_summary,
+                model=model,
                 now=now,
             )
 
@@ -320,6 +324,7 @@ class AuditLogger:
                 "path": path,
                 "status_code": status_code,
                 "request_id": request_id,
+                "model": model,
                 "ms": round(latency, 2),
                 "bytes_in": int(bytes_in),
                 "bytes_out": int(bytes_out),
@@ -347,6 +352,7 @@ class AuditLogger:
                 "path": path,
                 "status": status_code,
                 "ms": round(latency, 2),
+                "model": model,
                 "chars_saved_input": chars_saved_in,
                 "chars_saved_output": chars_saved_out,
                 "engines_active": sorted(k for k, v in engines.items() if v > 0),

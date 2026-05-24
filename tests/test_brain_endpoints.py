@@ -113,6 +113,57 @@ def test_cost_reset_zeros_counters() -> None:
     assert cost_tracker.snapshot()["total_usd"] == 0.0
 
 
+def test_cost_reset_also_resets_budget() -> None:
+    """`/cost/reset` should clear the budget counters in the same shot.
+
+    Operators rolling over a billing period don't want stale ``chars_used``
+    values lingering after a reset — that was the bug a recent live test
+    exposed.
+    """
+    from middleout_proxy.server import app, cost_tracker, usage_budget
+    from middleout_proxy.cost import RequestCost
+
+    cost_tracker.record(RequestCost(
+        provider="anthropic", model="claude-3-5-sonnet",
+        input_tokens=1, output_tokens=1, usd=0.01, matched=True,
+    ))
+    usage_budget.record(chars=12345, tokens=678)
+    assert usage_budget.snapshot()["chars_used"] == 12345
+    assert usage_budget.snapshot()["tokens_used"] == 678
+
+    with TestClient(app) as client:
+        r = client.post("/cost/reset")
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {"reset": True, "total_usd": 0.0, "budget_reset": True}
+
+    assert cost_tracker.snapshot()["total_usd"] == 0.0
+    assert usage_budget.snapshot()["chars_used"] == 0
+    assert usage_budget.snapshot()["tokens_used"] == 0
+
+
+def test_budget_reset_endpoint_zeroes_budget_only() -> None:
+    """`/budget/reset` clears budget counters but keeps cost-tracker rows."""
+    from middleout_proxy.server import app, cost_tracker, usage_budget
+    from middleout_proxy.cost import RequestCost
+
+    cost_tracker.record(RequestCost(
+        provider="anthropic", model="claude-3-5-sonnet",
+        input_tokens=1, output_tokens=1, usd=0.05, matched=True,
+    ))
+    usage_budget.record(chars=999, tokens=99)
+
+    with TestClient(app) as client:
+        r = client.post("/budget/reset")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["reset"] is True
+    assert body["budget"]["chars_used"] == 0
+    assert body["budget"]["tokens_used"] == 0
+    # cost tracker must be untouched
+    assert cost_tracker.snapshot()["total_usd"] > 0
+
+
 # -- /providers -------------------------------------------------------------
 
 
@@ -184,6 +235,92 @@ def test_model_hint_for_anthropic_passes_through(monkeypatch) -> None:
             json={"model": "claude-3-5-sonnet", "messages": []},
         )
     assert r.status_code == 200
+
+
+def test_audit_log_captures_request_model(monkeypatch) -> None:
+    """Each upstream-successful request must tag its audit row with the request body's model."""
+    from middleout_proxy import server as server_module
+
+    class _Resp:
+        def __init__(self) -> None:
+            self.status_code = 200
+            self.content = b'{"id":"m1","model":"claude-3-5-sonnet","content":[]}'
+            self.headers = {"content-type": "application/json"}
+
+        def json(self):  # noqa: D401
+            return json.loads(self.content.decode("utf-8"))
+
+    class _FakeClient:
+        async def request(self, *args, **kwargs):
+            return _Resp()
+
+        async def aclose(self):
+            pass
+
+    with TestClient(server_module.app) as client:
+        monkeypatch.setattr(server_module.app.state, "http", _FakeClient())
+        r = client.post(
+            "/v1/messages",
+            headers={"Authorization": "Bearer t"},
+            json={"model": "claude-3-5-sonnet-latest", "messages": []},
+        )
+        assert r.status_code == 200
+        recent = client.get("/stats/recent?n=1").json()
+    items = recent.get("items") or []
+    assert len(items) >= 1
+    assert items[-1]["model"] == "claude-3-5-sonnet-latest"
+
+
+def test_brain_engine_headers_emitted_on_compressed_response(monkeypatch) -> None:
+    """When compression actually fires, the response carries `x-brain-engines`
+    (per-engine breakdown) and `x-brain-chars-saved-in` (alias for the legacy
+    `x-middleout-input-chars-saved` header).
+    """
+    from middleout_proxy import server as server_module
+
+    class _Resp:
+        def __init__(self) -> None:
+            self.status_code = 200
+            self.content = b'{"id":"m1","model":"claude-3-5-sonnet","content":[]}'
+            self.headers = {"content-type": "application/json"}
+
+        def json(self):  # noqa: D401
+            return json.loads(self.content.decode("utf-8"))
+
+    class _FakeClient:
+        async def request(self, *args, **kwargs):
+            return _Resp()
+
+        async def aclose(self):
+            pass
+
+    # A request large + repetitive enough for at least one engine to fire.
+    msg = "the quick brown fox jumps over the lazy dog please just basically " * 200
+    with TestClient(server_module.app) as client:
+        monkeypatch.setattr(server_module.app.state, "http", _FakeClient())
+        # Make sure the legacy engines are on (default is on, but be explicit).
+        client.post("/settings", json={"caveman": {"enabled": True, "level": "standard"}})
+        r = client.post(
+            "/v1/messages",
+            headers={"Authorization": "Bearer t"},
+            json={
+                "model": "claude-3-5-sonnet",
+                "messages": [{"role": "user", "content": msg}],
+            },
+        )
+    assert r.status_code == 200
+    # Brain-prefixed alias header should always come along with the legacy one.
+    assert "x-brain-chars-saved-in" in r.headers
+    assert r.headers["x-brain-chars-saved-in"] == r.headers["x-middleout-input-chars-saved"]
+    # Per-engine line is only set when at least one engine saved bytes — for
+    # this oversized verbose-English payload, caveman should definitely fire.
+    if int(r.headers["x-brain-chars-saved-in"]) > 0:
+        assert "x-brain-engines" in r.headers
+        # Format: comma-separated `name=savedBytes`
+        for part in r.headers["x-brain-engines"].split(","):
+            k, _, v = part.partition("=")
+            assert k.strip(), part
+            assert v.strip().isdigit(), part
 
 
 # -- /cache/stats + /cache/purge -------------------------------------------
@@ -349,3 +486,71 @@ def test_cost_tracking_unknown_model_is_unmatched(monkeypatch) -> None:
     assert snap["total_requests"] == 1
     assert snap["unmatched_requests"] == 1
     assert snap["total_usd"] == 0.0
+
+
+# -- runtime persistence sync ----------------------------------------------
+
+
+def test_persisted_l2_runtime_flag_syncs_l2cache_enabled(tmp_path) -> None:
+    """Persisted `l2_cache: true` must sync onto the live L2Cache.enabled.
+
+    Regression: a process that boots with BRAIN_L2_CACHE_ENABLED unset (so
+    `l2_cache.enabled == False` at construction) but a persisted runtime
+    snapshot of `l2_cache: true` would report `True` from /settings but
+    `False` from /healthz, and L2 lookups would be silently skipped.
+
+    Uses a subprocess so module-level side effects don't leak into other
+    tests in this session.
+    """
+    import json
+    import subprocess
+    import sys
+
+    (tmp_path / "runtime_settings.json").write_text(
+        json.dumps({
+            "input_compression": True,
+            "output_compression": True,
+            "l2_cache": True,
+        })
+    )
+
+    script = (
+        "import json\n"
+        "import middleout_proxy.server as srv\n"
+        "from fastapi.testclient import TestClient\n"
+        "out = {\n"
+        "    'runtime_l2': srv._runtime.get('l2_cache'),\n"
+        "    'l2cache_obj_exists': srv.l2_cache is not None,\n"
+        "    'l2cache_obj_enabled': srv.l2_cache.enabled if srv.l2_cache else None,\n"
+        "}\n"
+        "with TestClient(srv.app) as client:\n"
+        "    out['healthz_l2'] = client.get('/healthz').json()['l2_cache_enabled']\n"
+        "    out['settings_l2'] = client.get('/settings').json()['l2_cache']\n"
+        "print(json.dumps(out))\n"
+    )
+
+    env = {
+        "PATH": __import__("os").environ.get("PATH", ""),
+        "PYTHONPATH": __import__("os").environ.get("PYTHONPATH", "src"),
+        "MIDDLEOUT_AUDIT_DIR": str(tmp_path),
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert result.returncode == 0, f"subprocess failed: {result.stderr}"
+    out = json.loads(result.stdout.strip().splitlines()[-1])
+
+    assert out["runtime_l2"] is True
+    assert out["l2cache_obj_exists"] is True
+    assert out["l2cache_obj_enabled"] is True, (
+        "L2Cache.enabled must follow the persisted runtime flag at boot, "
+        "not the (likely-False) env-driven default"
+    )
+    assert out["healthz_l2"] is True
+    assert out["settings_l2"] is True
+
+

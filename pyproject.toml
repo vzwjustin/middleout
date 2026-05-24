@@ -19,6 +19,18 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.5"]
+# Brain proxy phase-2/3/4 extras. Pull in only the ones you need.
+lingua = ["llmlingua>=0.2.2"]
+qdrant = ["qdrant-client>=1.7"]
+openai = ["openai>=1.0"]
+http2 = ["h2>=4.0"]
+# Convenience meta-extra that installs every brain dep.
+brain = [
+  "llmlingua>=0.2.2",
+  "qdrant-client>=1.7",
+  "openai>=1.0",
+  "h2>=4.0",
+]
 
 [project.scripts]
 middleout-proxy = "middleout_proxy.server:main"

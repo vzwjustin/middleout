@@ -64,28 +64,34 @@ lingua_compressor = LinguaCompressor(
     default_ratio=settings.lingua_ratio,
 )
 l1_cache: L1Cache | None = None
-if settings.l1_cache_enabled:
+# Always construct the L1 cache so the runtime toggle (`/settings POST
+# l1_cache:true`) can flip it on without restarting. If the user disabled
+# L1 at startup we still keep the object so the dashboard can flip it.
+# A construction failure (bad db_path, FS perms) is logged but does not
+# kill the proxy — the runtime toggle simply has no effect.
+try:
     l1_cache = L1Cache(
         settings.l1_cache_db_path,
         max_entries=settings.l1_cache_max_entries,
         max_body_bytes=settings.l1_cache_max_body_bytes,
     )
+except Exception as e:  # noqa: BLE001 — never fail boot on L1 db init
+    import logging
+    logging.getLogger(__name__).warning(
+        "L1 cache disabled at startup: %s: %s", type(e).__name__, e
+    )
+    l1_cache = None
 
 # L2 semantic cache (Phase 2b) — wired into the request pipeline.
 # Backend + embedder are picked from settings. Failures during construction
 # degrade gracefully: L2 stays off and the misconfig surfaces via /healthz,
 # rather than failing the proxy boot.
+#
+# We ALWAYS try to build a working L2Cache (even if disabled in settings) so
+# the runtime toggle in the dashboard can flip it on without a restart. When
+# settings say disabled, we start it with `enabled=False` — the runtime flag
+# alone flips `.enabled = True` afterwards.
 def _build_l2_cache(s: Settings) -> tuple["L2Cache", str | None]:
-    if not s.l2_cache_enabled:
-        return (
-            L2Cache(
-                embedding_client=None,
-                vector_store=None,
-                similarity_threshold=s.l2_similarity_threshold,
-                enabled=False,
-            ),
-            None,
-        )
     try:
         if s.l2_embedder == "openai":
             embedder = OpenAIEmbeddingClient(
@@ -96,20 +102,26 @@ def _build_l2_cache(s: Settings) -> tuple["L2Cache", str | None]:
             embedder = HashEmbedder(dim=s.l2_embedding_dim)
         if s.l2_backend == "qdrant":
             if not s.l2_qdrant_url:
-                raise ValueError(
-                    "BRAIN_L2_BACKEND=qdrant but BRAIN_L2_QDRANT_URL is empty"
+                # Qdrant explicitly requested but not configured — fall back
+                # to in-memory so the toggle still works, but surface the
+                # misconfig only when the user actually enabled L2.
+                if s.l2_cache_enabled:
+                    raise ValueError(
+                        "BRAIN_L2_BACKEND=qdrant but BRAIN_L2_QDRANT_URL is empty"
+                    )
+                store = InMemoryVectorStore(max_entries=s.l2_max_entries)
+            else:
+                store = QdrantVectorStore(
+                    url=s.l2_qdrant_url,
+                    collection=s.l2_qdrant_collection,
+                    dim=s.l2_embedding_dim,
+                    api_key=s.l2_qdrant_api_key or None,
                 )
-            store = QdrantVectorStore(
-                url=s.l2_qdrant_url,
-                collection=s.l2_qdrant_collection,
-                dim=s.l2_embedding_dim,
-                api_key=s.l2_qdrant_api_key or None,
-            )
         else:
             store = InMemoryVectorStore(max_entries=s.l2_max_entries)
         return (
             L2Cache(
-                enabled=True,
+                enabled=bool(s.l2_cache_enabled),
                 embedding_client=embedder,
                 vector_store=store,
                 similarity_threshold=s.l2_similarity_threshold,
@@ -185,7 +197,7 @@ def _load_persisted_runtime() -> None:
         saved = json.loads(_RUNTIME_PERSIST_PATH.read_text())
         if not isinstance(saved, dict):
             return
-        for k in ("input_compression", "output_compression", "jl_dedupe", "auto_insert_wall", "adaptive", "l1_cache"):
+        for k in ("input_compression", "output_compression", "jl_dedupe", "auto_insert_wall", "adaptive", "l1_cache", "l2_cache"):
             if k in saved:
                 _runtime[k] = bool(saved[k])
         for engine_key in ("caveman", "rtk", "lingua", "json_aware", "lsh"):
@@ -195,13 +207,31 @@ def _load_persisted_runtime() -> None:
         pass
 
 def _save_runtime() -> None:
+    """Atomic write: serialize, write to a sibling tmp file, then rename.
+
+    Power-fail and racing-reader safety: a partial write never replaces the
+    canonical file, and a concurrent reader observes either the old contents
+    or the new contents — never a mix.
+    """
     try:
         _RUNTIME_PERSIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _RUNTIME_PERSIST_PATH.write_text(json.dumps(_runtime))
+        payload = json.dumps(_runtime)
+        tmp = _RUNTIME_PERSIST_PATH.with_suffix(
+            _RUNTIME_PERSIST_PATH.suffix + ".tmp"
+        )
+        tmp.write_text(payload)
+        tmp.replace(_RUNTIME_PERSIST_PATH)
     except OSError:
         pass
 
 _load_persisted_runtime()
+
+# Sync the L2 cache's own `.enabled` flag with the runtime snapshot. Without
+# this, a process that boots with BRAIN_L2_CACHE_ENABLED unset but a persisted
+# `l2_cache: true` runtime flag would report `l2_cache_enabled: True` in
+# /settings but `False` in /healthz, and L2 lookups would be silently skipped.
+if l2_cache is not None:
+    l2_cache.enabled = bool(_runtime.get("l2_cache", False))
 
 
 def _client_timeout(settings: Settings) -> httpx.Timeout:
@@ -426,6 +456,11 @@ async def _post_settings_locked(body: dict) -> Response:
         _runtime["lingua"] = current
 
     _save_runtime()
+    # Side-effects: keep L2Cache.enabled in sync with the runtime toggle so
+    # the dashboard can flip L2 on/off without a restart. L1 is always-built
+    # so its toggle is just the rt["l1_cache"] gate at request time.
+    if l2_cache is not None and l2_cache.embedding_client is not None and l2_cache.vector_store is not None:
+        l2_cache.enabled = bool(_runtime["l2_cache"])
     return JSONResponse(content=dict(_runtime))
 
 
@@ -498,9 +533,22 @@ async def cost() -> dict[str, Any]:
 
 @app.post("/cost/reset")
 async def cost_reset() -> dict[str, Any]:
-    """Zero the cost tracker counters. Useful for operator-initiated rollover."""
+    """Zero the cost tracker counters AND the usage budget counters.
+
+    Operators rolling over their billing period typically want both axes
+    cleared atomically — otherwise `/cost` keeps showing stale
+    ``budget.chars_used`` values that no longer match the per-model rows.
+    """
     cost_tracker.reset()
-    return {"reset": True, "total_usd": 0.0}
+    usage_budget.reset()
+    return {"reset": True, "total_usd": 0.0, "budget_reset": True}
+
+
+@app.post("/budget/reset")
+async def budget_reset() -> dict[str, Any]:
+    """Zero just the usage budget counters. Cost tracker is left untouched."""
+    usage_budget.reset()
+    return {"reset": True, "budget": usage_budget.snapshot()}
 
 
 @app.get("/providers")
@@ -622,6 +670,9 @@ async def proxy(path: str, request: Request) -> Response:
     # we have a JSON-shaped /v1/messages request. Captured AFTER compression
     # so two requests that compress to the same bytes share a cache entry.
     cache_lookup_payload: dict[str, Any] | None = None
+    # `request_model` is the model id from the request body (Anthropic Messages
+    # API). Used for audit-log tagging so operators can filter by model later.
+    request_model: str | None = None
 
     # FIX A: snapshot _runtime once under the lock. All subsequent reads in
     # this handler use the snapshot, so a concurrent POST /settings cannot
@@ -632,6 +683,10 @@ async def proxy(path: str, request: Request) -> Response:
     try:
         if rt["input_compression"] and _should_transform_json_request(path, request.method, request.headers, body_bytes):
             payload = json.loads(body_bytes.decode("utf-8"))
+            if isinstance(payload, dict):
+                m = payload.get("model")
+                if isinstance(m, str):
+                    request_model = m
 
             # Phase 1: LLMLingua-2 on the volatile tail, gated by the cache wall.
             # This runs BEFORE the legacy middle-out engines so they see the
@@ -775,6 +830,7 @@ async def proxy(path: str, request: Request) -> Response:
                 latency_ms=(time.perf_counter() - started_perf) * 1000.0,
                 bytes_in=bytes_in,
                 bytes_out=len(cached.body),
+                model=request_model,
             )
             return Response(
                 content=cached.body,
@@ -816,6 +872,7 @@ async def proxy(path: str, request: Request) -> Response:
                 latency_ms=(time.perf_counter() - started_perf) * 1000.0,
                 bytes_in=bytes_in,
                 bytes_out=len(hit.response.body),
+                model=request_model,
             )
             return Response(
                 content=hit.response.body,
@@ -838,6 +895,7 @@ async def proxy(path: str, request: Request) -> Response:
                 wall_auto_inserted=wall_auto_inserted,
                 started_perf=started_perf,
                 bytes_in=bytes_in,
+                request_model=request_model,
             )
 
         upstream_response = await app.state.http.request(
@@ -939,6 +997,7 @@ async def proxy(path: str, request: Request) -> Response:
             latency_ms=(time.perf_counter() - started_perf) * 1000.0,
             bytes_in=bytes_in,
             bytes_out=len(response_content) if response_content else 0,
+            model=request_model,
         )
 
         # L1 + L2 CACHE STORE: on a successful upstream response, populate
@@ -982,6 +1041,7 @@ async def proxy(path: str, request: Request) -> Response:
             latency_ms=(time.perf_counter() - started_perf) * 1000.0,
             bytes_in=bytes_in,
             bytes_out=0,
+            model=request_model,
         )
         return JSONResponse(
             status_code=502,
@@ -1007,6 +1067,7 @@ async def _streaming_forward(
     bytes_in: int,
     lingua_chars_saved: int = 0,
     wall_auto_inserted: bool = False,
+    request_model: str | None = None,
 ) -> StreamingResponse:
     # FIX B: pin accept-encoding to identity for streaming. httpx otherwise
     # injects "gzip, deflate, br" by default; if upstream returns a non-SSE
@@ -1043,6 +1104,7 @@ async def _streaming_forward(
                 latency_ms=(time.perf_counter() - started_perf) * 1000.0,
                 bytes_in=bytes_in,
                 bytes_out=bytes_out,
+                model=request_model,
             )
             await upstream_response.aclose()
 
@@ -1129,10 +1191,29 @@ def _forward_response_headers(headers: Any) -> dict[str, str]:
 
 
 def _compression_headers(audit: CompressionAudit, *, prefix: str) -> dict[str, str]:
-    return {
-        f"x-middleout-{prefix}-chars-saved": str(audit.chars_saved),
-        f"x-middleout-{prefix}-events": str(len(audit.events)),
+    # Emit both the legacy `x-middleout-*` and the new `x-brain-*` names so
+    # operators and dashboards can pick whichever prefix they prefer.
+    saved = str(audit.chars_saved)
+    events = str(len(audit.events))
+    headers: dict[str, str] = {
+        f"x-middleout-{prefix}-chars-saved": saved,
+        f"x-middleout-{prefix}-events": events,
+        # `prefix` is "input" or "output"; map to in/out for the brain alias.
+        f"x-brain-chars-saved-{'in' if prefix == 'input' else 'out'}": saved,
     }
+    # x-brain-engines is a comma-separated list of engines that actually fired
+    # (i.e. saved > 0). Easier to grep than digging the structured audit.
+    by_engine: dict[str, int] = {}
+    for ev in audit.events:
+        mode = getattr(ev, "mode", None) or "unknown"
+        if int(getattr(ev, "chars_saved", 0)) <= 0:
+            continue
+        by_engine[mode] = by_engine.get(mode, 0) + int(ev.chars_saved)
+    if by_engine:
+        # Sort by chars-saved descending; helps operators scan top engines first.
+        ordered = sorted(by_engine.items(), key=lambda kv: -kv[1])
+        headers["x-brain-engines"] = ",".join(f"{k}={v}" for k, v in ordered)
+    return headers
 
 
 def _brain_headers(*, lingua_chars_saved: int, wall_auto_inserted: bool) -> dict[str, str]:

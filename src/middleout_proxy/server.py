@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import time
 from typing import Any
 
 import httpx
@@ -152,6 +153,27 @@ async def stats() -> dict[str, Any]:
     return snap
 
 
+@app.get("/stats/timeseries")
+async def stats_timeseries() -> dict[str, Any]:
+    """Rolling 1-minute buckets, oldest -> newest, for the last window_minutes.
+
+    Each bucket: minute_ts, requests, errors, chars_saved_in, chars_saved_out,
+    bytes_in, bytes_out, engines (per-engine chars_saved), p50_ms, p95_ms.
+    Read-only. Never contains raw payload text.
+    """
+    return {
+        "window_minutes": audit_logger.stats.window_minutes,
+        "buckets": audit_logger.stats.timeseries(),
+    }
+
+
+@app.get("/stats/recent")
+async def stats_recent(n: int = 50) -> dict[str, Any]:
+    """Last N audit records (hashes + stats only — NEVER raw payload text)."""
+    n = max(0, min(int(n), audit_logger.stats.recent_max))
+    return {"count": n, "items": audit_logger.stats.recent(n)}
+
+
 @app.get("/settings")
 async def get_settings() -> dict[str, Any]:
     return dict(_runtime)
@@ -284,6 +306,8 @@ async def proxy(path: str, request: Request) -> Response:
         upstream_url = f"{upstream_url}?{request.url.query}"
 
     body_bytes = await request.body()
+    started_perf = time.perf_counter()
+    bytes_in = len(body_bytes) if body_bytes else 0
     request_audit = CompressionAudit(endpoint=path)
     outgoing_content: bytes | None = body_bytes if body_bytes else None
     wall_auto_inserted = False
@@ -358,6 +382,8 @@ async def proxy(path: str, request: Request) -> Response:
                 path=path,
                 lingua_chars_saved=lingua_chars_saved,
                 wall_auto_inserted=wall_auto_inserted,
+                started_perf=started_perf,
+                bytes_in=bytes_in,
             )
 
         upstream_response = await app.state.http.request(
@@ -396,6 +422,9 @@ async def proxy(path: str, request: Request) -> Response:
             request_audit=request_audit,
             response_audit=response_audit,
             request_id=upstream_response.headers.get("request-id"),
+            latency_ms=(time.perf_counter() - started_perf) * 1000.0,
+            bytes_in=bytes_in,
+            bytes_out=len(response_content) if response_content else 0,
         )
 
         return Response(
@@ -411,6 +440,9 @@ async def proxy(path: str, request: Request) -> Response:
             status_code=None,
             request_audit=request_audit,
             error=f"{type(exc).__name__}: {exc}",
+            latency_ms=(time.perf_counter() - started_perf) * 1000.0,
+            bytes_in=bytes_in,
+            bytes_out=0,
         )
         return JSONResponse(
             status_code=502,
@@ -432,6 +464,8 @@ async def _streaming_forward(
     content: bytes | None,
     request_audit: CompressionAudit,
     path: str,
+    started_perf: float,
+    bytes_in: int,
     lingua_chars_saved: int = 0,
     wall_auto_inserted: bool = False,
 ) -> StreamingResponse:
@@ -452,9 +486,13 @@ async def _streaming_forward(
         )
     )
 
+    bytes_out = 0
+
     async def body_iter():
+        nonlocal bytes_out
         try:
             async for chunk in upstream_response.aiter_raw():
+                bytes_out += len(chunk)
                 yield chunk
         finally:
             audit_logger.record(
@@ -463,6 +501,9 @@ async def _streaming_forward(
                 status_code=upstream_response.status_code,
                 request_audit=request_audit,
                 request_id=upstream_response.headers.get("request-id"),
+                latency_ms=(time.perf_counter() - started_perf) * 1000.0,
+                bytes_in=bytes_in,
+                bytes_out=bytes_out,
             )
             await upstream_response.aclose()
 

@@ -117,6 +117,9 @@ class Settings:
     audit_enabled: bool = _bool_env("MIDDLEOUT_AUDIT", True)
     audit_log_dir: Path = Path(os.getenv("MIDDLEOUT_AUDIT_DIR", ".middleout-logs"))
     log_text_samples: bool = _bool_env("MIDDLEOUT_LOG_TEXT_SAMPLES", False)
+    log_json: bool = _bool_env("MIDDLEOUT_LOG_JSON", False)
+    timeseries_minutes: int = _int_env("MIDDLEOUT_TIMESERIES_MINUTES", 60)
+    recent_max: int = _int_env("MIDDLEOUT_RECENT_MAX", 200)
 
     # HTTP behavior
     timeout_connect_s: float = _float_env("MIDDLEOUT_CONNECT_TIMEOUT_S", 30.0)

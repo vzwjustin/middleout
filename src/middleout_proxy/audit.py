@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import time
+from datetime import datetime, timezone
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -328,4 +330,23 @@ class AuditLogger:
             with self._lock:
                 with self._log_path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        if getattr(self.settings, "log_json", False):
+            structured = {
+                "ts": _iso_now(now),
+                "method": method,
+                "path": path,
+                "status": status_code,
+                "ms": round(latency, 2),
+                "chars_saved_input": chars_saved_in,
+                "chars_saved_output": chars_saved_out,
+                "engines_active": sorted(k for k, v in engines.items() if v > 0),
+                "request_id": request_id,
+            }
+            print(json.dumps(structured, ensure_ascii=False), file=sys.stderr, flush=True)
+
+
+def _iso_now(now: float | None) -> str:
+    t = time.time() if now is None else now
+    return datetime.fromtimestamp(t, tz=timezone.utc).isoformat()
 

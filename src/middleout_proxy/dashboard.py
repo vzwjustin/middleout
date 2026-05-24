@@ -145,6 +145,47 @@ footer .ts{font-family:var(--mono)}
   .hdr::after{animation:none;opacity:.4}
 }
 .badge.warn{background:rgba(245,158,11,.12);color:var(--amber);border-color:rgba(245,158,11,.3)}
+
+/* --- observability extension --- */
+.dual{display:grid;grid-template-columns:2fr 1fr;gap:14px}
+@media(max-width:900px){.dual{grid-template-columns:1fr}}
+.gauge{position:relative;width:100%;height:8px;background:var(--border);border-radius:4px;overflow:hidden}
+.gauge .gf{height:100%;background:linear-gradient(90deg,var(--green) 0%,var(--amber) 70%,var(--red) 100%);transition:width .4s var(--ease);width:0%}
+.chart-wrap{position:relative;width:100%;height:170px}
+.chart-wrap canvas{display:block;width:100%;height:100%}
+.legend{display:flex;gap:14px;font-size:12px;color:var(--sub);margin-top:8px;flex-wrap:wrap}
+.legend .sw{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:6px}
+.eng-bars{display:flex;flex-direction:column;gap:8px;min-height:120px}
+.eb{display:grid;grid-template-columns:120px 1fr auto;gap:10px;align-items:center;font-size:13px}
+.eb .ebn{font-family:var(--mono);color:var(--sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.eb .ebt{font-family:var(--mono);color:var(--text);font-variant-numeric:tabular-nums}
+.eb .ebbar{position:relative;height:6px;background:var(--border);border-radius:3px;overflow:hidden}
+.eb .ebbarfill{height:100%;background:var(--blue);border-radius:3px;transition:width .35s var(--ease);width:0%}
+.eb[data-engine^="caveman"] .ebbarfill{background:var(--amber)}
+.eb[data-engine^="rtk"] .ebbarfill{background:var(--violet)}
+.eb[data-engine^="jl"] .ebbarfill{background:var(--cyan)}
+.eb[data-engine="middle-out"] .ebbarfill{background:var(--blue)}
+.eb[data-engine$="-response"] .ebbarfill{background:linear-gradient(90deg,var(--green),var(--cyan))}
+.tbl-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:12px;background:var(--surface)}
+.tbl{width:100%;border-collapse:collapse;font-size:13px}
+.tbl thead th{position:sticky;top:0;background:var(--surface-2);font-weight:600;color:var(--sub);text-align:left;padding:9px 12px;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid var(--border)}
+.tbl td{padding:9px 12px;border-bottom:1px solid var(--border);vertical-align:top;font-family:var(--mono)}
+.tbl tr:last-child td{border-bottom:none}
+.tbl tr.rrow{cursor:pointer;transition:background .15s var(--ease)}
+.tbl tr.rrow:hover{background:var(--surface-2)}
+.tbl tr.detail td{background:#0e1219;padding:0;border-top:1px solid var(--border-2)}
+.tbl tr.detail .det-inner{padding:10px 14px;color:var(--sub);font-size:12px;display:flex;gap:18px;flex-wrap:wrap}
+.tbl tr.detail .det-eng{display:inline-flex;align-items:center;gap:6px;background:var(--surface);border:1px solid var(--border-2);padding:3px 8px;border-radius:6px;font-family:var(--mono);font-size:12px;color:var(--text)}
+.tbl tr.detail .det-eng b{color:var(--blue);font-weight:600}
+.tbl .nodata{text-align:center;color:var(--muted);padding:20px;font-family:var(--sans);font-size:13px;font-style:italic}
+.tbl .st-2xx{color:var(--green)}
+.tbl .st-4xx{color:var(--amber)}
+.tbl .st-5xx{color:var(--red)}
+.tbl .st-na{color:var(--muted)}
+.lat-tiles{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+.lat-tiles .cell{padding:14px 16px}
+.lat-tiles .cv{font-size:22px}
+
 </style>
 </head>
 <body>
@@ -249,6 +290,60 @@ footer .ts{font-family:var(--mono)}
       </div>
     </div>
 
+  </div>
+</section>
+
+
+<section>
+  <div class="sh">Latency &amp; Errors</div>
+  <div class="dual">
+    <div class="card">
+      <div class="brow">
+        <div data-tip="Rolling error rate over the time-series window&#10;(default 60 min). Errors are upstream 5xx or&#10;proxy connection failures."><div class="cl">Error rate</div><div class="bpct"><span id="o-err-pct" class="cv" style="font-size:22px">-</span></div></div>
+        <div style="text-align:right" data-tip-pos="left" data-tip="Errors observed in the current rolling&#10;window."><div class="cl" style="justify-content:flex-end">Errors (window)</div><div class="bpct small"><span id="o-err-count" class="cv" style="font-size:16px">-</span></div></div>
+      </div>
+      <div class="gauge" data-tip="0% (green) -> 10% (red).&#10;Bar reflects current rolling error rate."><div class="gf" id="o-err-gauge"></div></div>
+      <div class="bsub" style="margin-top:10px">
+        <div>Window <b id="o-err-window">-</b> &middot; Requests <b id="o-err-req">-</b></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="lat-tiles">
+        <div class="cell" data-tip="Median request latency across all requests&#10;since startup (fixed-bin histogram, ms)."><div class="cl">p50 latency</div><div class="cv" id="o-p50">-</div></div>
+        <div class="cell" data-tip="95th percentile request latency across all&#10;requests since startup."><div class="cl">p95 latency</div><div class="cv" id="o-p95">-</div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="sh">Chars saved (last 60 min)</div>
+  <div class="card">
+    <div class="chart-wrap" data-tip-pos="top" data-tip="Live: input vs output chars saved per minute.&#10;Empty until requests arrive."><canvas id="o-chart-saved" width="800" height="170"></canvas></div>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--blue)"></span>input chars saved/min</span>
+      <span><span class="sw" style="background:var(--green)"></span>output chars saved/min</span>
+      <span><span class="sw" style="background:var(--red)"></span>errors/min</span>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="sh">Engine attribution</div>
+  <div class="card">
+    <div class="eng-bars" id="o-eng-bars">
+      <div class="nodata" style="font-family:var(--sans);color:var(--muted);font-style:italic;padding:8px 0">No engine activity yet.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="sh">Recent requests</div>
+  <div class="tbl-wrap">
+    <table class="tbl" id="o-recent">
+      <thead><tr><th>Path</th><th>Status</th><th>ms</th><th>Saved (in/out)</th><th>Request ID</th></tr></thead>
+      <tbody id="o-recent-body"><tr><td class="nodata" colspan="5">No requests yet.</td></tr></tbody>
+    </table>
   </div>
 </section>
 
@@ -465,6 +560,130 @@ refreshStats();refreshHealth();refreshSettings();
 setInterval(refreshStats,1000);
 setInterval(refreshHealth,30000);
 setInterval(refreshSettings,10000);
+
+// --- observability ---
+const O_PALETTE={input:'#3b82f6',output:'#3fb950',err:'#f85149',axis:'#525a6b',grid:'#222936',text:'#8a94a6'};
+
+function oFmtMs(v){if(v==null||isNaN(v)||v<=0)return'-';if(v<1)return v.toFixed(2)+'ms';if(v<1000)return Math.round(v)+'ms';return (v/1000).toFixed(1)+'s'}
+function oFmtPct(v){if(v==null||isNaN(v))return'-';return v.toFixed(v>=10?0:1)+'%'}
+function oFmtTs(ts){try{const d=new Date(ts*1000);return d.toLocaleTimeString();}catch(e){return '-';}}
+
+function oDrawSavedChart(buckets){
+  const canvas=document.getElementById('o-chart-saved');if(!canvas)return;
+  // High-DPI scale.
+  const cssW=canvas.clientWidth||canvas.width;const cssH=canvas.clientHeight||canvas.height;
+  const dpr=window.devicePixelRatio||1;
+  if(canvas.width!==cssW*dpr||canvas.height!==cssH*dpr){canvas.width=cssW*dpr;canvas.height=cssH*dpr;}
+  const ctx=canvas.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,cssW,cssH);
+  const W=cssW,H=cssH;const padL=36,padR=8,padT=6,padB=18;const innerW=W-padL-padR,innerH=H-padT-padB;
+  // Axes / grid
+  ctx.strokeStyle=O_PALETTE.grid;ctx.lineWidth=1;
+  for(let i=0;i<=4;i++){const y=padT+innerH*i/4;ctx.beginPath();ctx.moveTo(padL,y);ctx.lineTo(W-padR,y);ctx.stroke();}
+  ctx.fillStyle=O_PALETTE.text;ctx.font='11px ui-monospace,Menlo,monospace';ctx.textAlign='right';ctx.textBaseline='middle';
+  if(!buckets||buckets.length===0){
+    ctx.fillStyle=O_PALETTE.text;ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText('waiting for traffic',W/2,H/2);
+    return;
+  }
+  let maxV=1;for(const b of buckets){const v=Math.max(b.chars_saved_in||0,b.chars_saved_out||0);if(v>maxV)maxV=v;}
+  // y-axis labels
+  for(let i=0;i<=4;i++){const y=padT+innerH*i/4;const val=Math.round(maxV*(1-i/4));ctx.fillStyle=O_PALETTE.text;ctx.textAlign='right';ctx.fillText(fmt(val),padL-4,y);}
+  const n=buckets.length;const xFor=i=>padL+(n<=1?innerW/2:innerW*i/(n-1));
+  const yFor=v=>padT+innerH*(1-Math.min(1,v/maxV));
+  function drawLine(key,color){
+    ctx.strokeStyle=color;ctx.lineWidth=1.8;ctx.beginPath();
+    for(let i=0;i<n;i++){const x=xFor(i);const y=yFor(buckets[i][key]||0);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);}
+    ctx.stroke();
+    ctx.fillStyle=color;for(let i=0;i<n;i++){const x=xFor(i);const y=yFor(buckets[i][key]||0);ctx.beginPath();ctx.arc(x,y,1.5,0,Math.PI*2);ctx.fill();}
+  }
+  drawLine('chars_saved_in',O_PALETTE.input);
+  drawLine('chars_saved_out',O_PALETTE.output);
+  // Error overlay (red dots scaled to errors)
+  ctx.fillStyle=O_PALETTE.err;
+  let maxErr=0;for(const b of buckets)if((b.errors||0)>maxErr)maxErr=b.errors||0;
+  if(maxErr>0){
+    for(let i=0;i<n;i++){const e=buckets[i].errors||0;if(!e)continue;const x=xFor(i);const r=Math.min(5,2+(e/maxErr)*3);ctx.beginPath();ctx.arc(x,padT+innerH+padB*0.4,r,0,Math.PI*2);ctx.fill();}
+  }
+  // Time axis: first and last bucket labels.
+  ctx.textAlign='center';ctx.textBaseline='top';ctx.fillStyle=O_PALETTE.text;
+  ctx.fillText(oFmtTs(buckets[0].minute_ts),xFor(0),H-padB+2);
+  ctx.fillText(oFmtTs(buckets[n-1].minute_ts),xFor(n-1),H-padB+2);
+}
+
+function oRenderEngineBars(buckets){
+  const wrap=document.getElementById('o-eng-bars');if(!wrap)return;
+  const totals={};
+  for(const b of (buckets||[])){for(const [k,v] of Object.entries(b.engines||{})){totals[k]=(totals[k]||0)+v;}}
+  const entries=Object.entries(totals).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]);
+  if(entries.length===0){wrap.innerHTML='<div class="nodata" style="font-family:var(--sans);color:var(--muted);font-style:italic;padding:8px 0">No engine activity yet.</div>';return;}
+  const max=entries[0][1];
+  const html=[];
+  for(const [name,saved] of entries){
+    const w=Math.max(2,Math.round((saved/max)*100));
+    const safeName=String(name).replace(/[<>&"]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;","\"":"&quot;"})[c]);
+    html.push('<div class="eb" data-engine="'+safeName+'"><div class="ebn">'+safeName+'</div><div class="ebbar"><div class="ebbarfill" style="width:'+w+'%"></div></div><div class="ebt">'+fmt(saved)+'</div></div>');
+  }
+  wrap.innerHTML=html.join('');
+}
+
+function oRenderRecent(items){
+  const body=document.getElementById('o-recent-body');if(!body)return;
+  if(!items||items.length===0){body.innerHTML='<tr><td class="nodata" colspan="5">No requests yet.</td></tr>';return;}
+  const newest=items.slice().reverse();
+  const html=[];
+  for(let i=0;i<newest.length;i++){
+    const r=newest[i];
+    let cls='st-na';if(r.status_code){if(r.status_code<300)cls='st-2xx';else if(r.status_code<500)cls='st-4xx';else cls='st-5xx';}
+    const path=String(r.path||'').replace(/[<>&"]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;","\"":"&quot;"})[c]);
+    const reqId=r.request_id?String(r.request_id).slice(0,18):'-';
+    const saved=fmt(r.chars_saved_in||0)+' / '+fmt(r.chars_saved_out||0);
+    html.push('<tr class="rrow" data-idx="'+i+'"><td>'+path+'</td><td class="'+cls+'">'+(r.status_code||'-')+'</td><td>'+oFmtMs(r.ms)+'</td><td>'+saved+'</td><td>'+reqId+'</td></tr>');
+    // Detail row, hidden by default.
+    const engEntries=Object.entries(r.engines||{}).filter(([,v])=>v>0);
+    const engHtml=engEntries.length?engEntries.map(([k,v])=>'<span class="det-eng"><b>'+k+'</b> '+fmt(v)+'</span>').join(''):'<span style="font-style:italic">no engine activity</span>';
+    const extra='ts '+oFmtTs(r.ts)+' &middot; bytes '+fmt(r.bytes_in||0)+'/'+fmt(r.bytes_out||0);
+    html.push('<tr class="detail" data-for="'+i+'" style="display:none"><td colspan="5"><div class="det-inner">'+engHtml+'<span style="margin-left:auto;color:var(--muted)">'+extra+'</span></div></td></tr>');
+  }
+  body.innerHTML=html.join('');
+  body.querySelectorAll('tr.rrow').forEach(row=>{
+    row.addEventListener('click',()=>{
+      const det=body.querySelector('tr.detail[data-for="'+row.dataset.idx+'"]');
+      if(!det)return;det.style.display=det.style.display==='none'?'':'none';
+    });
+  });
+}
+
+async function refreshObservability(){
+  try{
+    const [tsRes,recRes]=await Promise.all([
+      fetch('/stats/timeseries').then(r=>r.json()).catch(()=>({buckets:[]})),
+      fetch('/stats/recent?n=50').then(r=>r.json()).catch(()=>({items:[]})),
+    ]);
+    const buckets=(tsRes&&tsRes.buckets)||[];
+    oDrawSavedChart(buckets);
+    oRenderEngineBars(buckets);
+    // Error rate over window.
+    let req=0,err=0,lastP50=0,lastP95=0;
+    for(const b of buckets){req+=b.requests||0;err+=b.errors||0;if(b.p50_ms)lastP50=b.p50_ms;if(b.p95_ms)lastP95=b.p95_ms;}
+    const pct=req>0?(err/req)*100:0;
+    setVal('o-err-pct',oFmtPct(pct));
+    setVal('o-err-count',fmt(err));
+    setVal('o-err-req',fmt(req));
+    setVal('o-err-window',(tsRes&&tsRes.window_minutes?tsRes.window_minutes:60)+'m');
+    const gauge=document.getElementById('o-err-gauge');
+    if(gauge){const clamped=Math.min(100,pct*10);gauge.style.width=clamped+'%';}
+    // p50/p95 — prefer global from /stats for stability across the whole uptime.
+    try{const d=await fetch('/stats').then(r=>r.json());setVal('o-p50',oFmtMs(d.p50_ms));setVal('o-p95',oFmtMs(d.p95_ms));}
+    catch(e){setVal('o-p50',oFmtMs(lastP50));setVal('o-p95',oFmtMs(lastP95));}
+    oRenderRecent((recRes&&recRes.items)||[]);
+  }catch(e){}
+}
+
+refreshObservability();
+setInterval(refreshObservability,3000);
+window.addEventListener('resize',()=>{const c=document.getElementById('o-chart-saved');if(c){c.width=0;refreshObservability();}});
+
 </script>
 </body>
 </html>"""

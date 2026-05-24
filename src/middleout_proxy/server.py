@@ -9,17 +9,28 @@ from typing import Any
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from .adaptive import decide_levels as _adaptive_decide_levels
 from .adaptive import should_compress as _adaptive_should_compress
 from .audit import AuditLogger
-from .cache import CachedResponse, L1Cache, cache_key
+from .budget import UsageBudget
+from .cache import CachedResponse, L1Cache, cache_key, canonical_text
+from .cache.embedders import HashEmbedder, OpenAIEmbeddingClient
+from .cache.l2 import L2Cache
+from .cache.vector_stores import InMemoryVectorStore, QdrantVectorStore
 from .cache_wall import compute_wall
 from .compression import CompressionAudit, PayloadCompressor
 from .config import Settings, load_settings
+from .cost import CostTracker, estimate as estimate_cost, extract_usage_from_anthropic
 from .dashboard import _DASHBOARD_HTML
 from .lingua import LinguaCompressor
+from .metrics import render_prometheus
+from .policies import PolicyRouter
+from .preview import preview_compression
+from .providers import REGISTRY as PROVIDER_REGISTRY
+from .providers import AdapterNotImplemented, select_adapter
+from .providers.registry import routes_snapshot as _routes_snapshot
 from .volatile import compress_volatile_tail
 
 HOP_BY_HOP_HEADERS = {
@@ -60,6 +71,86 @@ if settings.l1_cache_enabled:
         max_body_bytes=settings.l1_cache_max_body_bytes,
     )
 
+# L2 semantic cache (Phase 2b) — wired into the request pipeline.
+# Backend + embedder are picked from settings. Failures during construction
+# degrade gracefully: L2 stays off and the misconfig surfaces via /healthz,
+# rather than failing the proxy boot.
+def _build_l2_cache(s: Settings) -> tuple["L2Cache", str | None]:
+    if not s.l2_cache_enabled:
+        return (
+            L2Cache(
+                embedding_client=None,
+                vector_store=None,
+                similarity_threshold=s.l2_similarity_threshold,
+                enabled=False,
+            ),
+            None,
+        )
+    try:
+        if s.l2_embedder == "openai":
+            embedder = OpenAIEmbeddingClient(
+                model=s.l2_openai_model,
+                dim=s.l2_embedding_dim,
+            )
+        else:
+            embedder = HashEmbedder(dim=s.l2_embedding_dim)
+        if s.l2_backend == "qdrant":
+            if not s.l2_qdrant_url:
+                raise ValueError(
+                    "BRAIN_L2_BACKEND=qdrant but BRAIN_L2_QDRANT_URL is empty"
+                )
+            store = QdrantVectorStore(
+                url=s.l2_qdrant_url,
+                collection=s.l2_qdrant_collection,
+                dim=s.l2_embedding_dim,
+                api_key=s.l2_qdrant_api_key or None,
+            )
+        else:
+            store = InMemoryVectorStore(max_entries=s.l2_max_entries)
+        return (
+            L2Cache(
+                enabled=True,
+                embedding_client=embedder,
+                vector_store=store,
+                similarity_threshold=s.l2_similarity_threshold,
+            ),
+            None,
+        )
+    except Exception as e:  # noqa: BLE001 — never fail boot on L2 misconfig
+        import logging
+        logging.getLogger(__name__).warning(
+            "L2 cache disabled at startup: %s: %s", type(e).__name__, e
+        )
+        return (
+            L2Cache(
+                embedding_client=None,
+                vector_store=None,
+                similarity_threshold=s.l2_similarity_threshold,
+                enabled=False,
+            ),
+            f"{type(e).__name__}: {e}",
+        )
+
+
+l2_cache, _l2_init_error = _build_l2_cache(settings)
+l2_cache_misconfigured: bool = (
+    settings.l2_cache_enabled and not l2_cache.enabled
+)
+
+# Cost tracker. Always on — per-request cost is recorded on the response
+# path for /v1/messages whenever the upstream returned a JSON body. The
+# tracker survives across process lifetime but never persists to disk.
+cost_tracker = CostTracker()
+
+# Usage budget. Limits are operator-controlled; default = unlimited so
+# the tracker is informational only.
+usage_budget = UsageBudget(char_limit=None, token_limit=None)
+
+# Policy router (per-model, per-endpoint overrides). Pulls from
+# `MIDDLEOUT_POLICIES` (JSON) at startup. Errors surface as a startup
+# failure — invalid policy JSON is operator error, not a runtime fallback.
+policy_router = PolicyRouter.from_env()
+
 _CAVEMAN_LEVELS = {"lite", "standard", "aggressive", "ultra"}
 _RTK_LEVELS = {"minimal", "standard", "aggressive"}
 _JSON_AWARE_LEVELS = {"safe", "standard", "aggressive"}
@@ -86,6 +177,7 @@ _runtime: dict = {
     "lingua": {"enabled": settings.lingua_enabled, "ratio": settings.lingua_ratio},
     "auto_insert_wall": settings.auto_insert_cache_wall,
     "l1_cache": settings.l1_cache_enabled,
+    "l2_cache": l2_cache.enabled,
 }
 
 def _load_persisted_runtime() -> None:
@@ -184,12 +276,20 @@ async def healthz() -> dict[str, Any]:
         "auto_insert_cache_wall": _runtime["auto_insert_wall"],
         "l1_cache_enabled": _runtime["l1_cache"] and l1_cache is not None,
         "l1_cache_backend": settings.l1_cache_db_path if l1_cache is not None else None,
+        "l2_cache_enabled": l2_cache.enabled,
+        "l2_cache_misconfigured": l2_cache_misconfigured,
+        "l2_cache_backend": settings.l2_backend if l2_cache.enabled else None,
+        "l2_embedder": settings.l2_embedder if l2_cache.enabled else None,
+        "l2_similarity_threshold": settings.l2_similarity_threshold,
+        "l2_init_error": _l2_init_error,
         "preserve_anthropic_cache": settings.preserve_anthropic_cache,
         "compression_cache_enabled": settings.compression_cache_enabled,
         "auth_mode": settings.auth_mode,
         "api_key_injection": False,
         "api_key_headers_rejected": True,
         "api_keys_supported": False,
+        "providers": sorted(PROVIDER_REGISTRY.keys()),
+        "phase": "1-cache-aware-compression + 2a-l1-cache + 2b-l2-stub + 3-provider-scaffold",
     }
 
 
@@ -198,6 +298,13 @@ async def stats() -> dict[str, Any]:
     snap = audit_logger.stats.snapshot()
     snap["result_cache"] = compressor.result_cache.stats()
     snap["preserve_anthropic_cache"] = settings.preserve_anthropic_cache
+    if l1_cache is not None:
+        snap["l1_cache"] = l1_cache.stats()
+    if l2_cache.enabled:
+        snap["l2_cache"] = l2_cache.stats()
+        store_stats = getattr(l2_cache.vector_store, "stats", None)
+        if callable(store_stats):
+            snap["l2_vector_store"] = store_stats()
     return snap
 
 
@@ -239,6 +346,7 @@ def _snapshot_runtime() -> dict[str, Any]:
         "jl_dedupe": _runtime["jl_dedupe"],
         "auto_insert_wall": _runtime["auto_insert_wall"],
         "l1_cache": _runtime["l1_cache"],
+        "l2_cache": _runtime["l2_cache"],
         "adaptive": _runtime["adaptive"],
         "caveman": dict(_runtime["caveman"]),
         "rtk": dict(_runtime["rtk"]),
@@ -256,7 +364,7 @@ async def post_settings(request: Request) -> Response:
 
 
 async def _post_settings_locked(body: dict) -> Response:
-    for k in ("input_compression", "output_compression", "jl_dedupe", "auto_insert_wall", "l1_cache", "adaptive"):
+    for k in ("input_compression", "output_compression", "jl_dedupe", "auto_insert_wall", "l1_cache", "l2_cache", "adaptive"):
         if k in body:
             _runtime[k] = bool(body[k])
 
@@ -328,6 +436,114 @@ async def dashboard() -> HTMLResponse:
     return HTMLResponse(content=_DASHBOARD_HTML)
 
 
+# --- Brain endpoints (preview, metrics, cost, providers, cache admin) -------
+
+
+@app.post("/preview")
+async def preview(request: Request) -> JSONResponse:
+    """Dry-run compression: pass a request payload, get sizes/savings/audit.
+
+    Pure analysis — never touches the network, never writes audit logs. Useful
+    for sizing prompts against the cache wall and for evaluating engine
+    settings before flipping them in production.
+    """
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"invalid JSON: {exc.msg}"},
+        )
+    if not isinstance(payload, dict):
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"body must be a JSON object, got {type(payload).__name__}"},
+        )
+    async with _runtime_lock:
+        rt = _snapshot_runtime()
+    try:
+        result = preview_compression(
+            payload,
+            settings,
+            jl_dedupe=bool(rt["jl_dedupe"]),
+            caveman=rt["caveman"],
+            rtk=rt["rtk"],
+        )
+    except Exception as exc:  # noqa: BLE001 — preview never raises to client
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": f"preview failed: {type(exc).__name__}: {exc}",
+            },
+        )
+    return JSONResponse(content=result)
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+async def metrics() -> PlainTextResponse:
+    """Prometheus-format snapshot of audit + cache + cost counters."""
+    snap = audit_logger.stats.snapshot()
+    snap["result_cache"] = compressor.result_cache.stats()
+    body = render_prometheus(snap, settings=settings)
+    return PlainTextResponse(content=body, media_type="text/plain; version=0.0.4")
+
+
+@app.get("/cost")
+async def cost() -> dict[str, Any]:
+    """Cumulative cost snapshot: USD by model, total requests, unmatched count."""
+    snap = cost_tracker.snapshot()
+    snap["budget"] = usage_budget.snapshot()
+    return snap
+
+
+@app.post("/cost/reset")
+async def cost_reset() -> dict[str, Any]:
+    """Zero the cost tracker counters. Useful for operator-initiated rollover."""
+    cost_tracker.reset()
+    return {"reset": True, "total_usd": 0.0}
+
+
+@app.get("/providers")
+async def providers() -> dict[str, Any]:
+    """Snapshot of registered provider adapters + routing rules."""
+    return _routes_snapshot()
+
+
+@app.get("/cache/stats")
+async def cache_stats() -> dict[str, Any]:
+    """Current L1 + L2 cache state for the operator."""
+    l1_stats: dict[str, Any] = {"enabled": False}
+    if l1_cache is not None and _runtime["l1_cache"]:
+        try:
+            l1_stats = l1_cache.stats()  # type: ignore[union-attr]
+            l1_stats["enabled"] = True
+        except Exception as exc:  # noqa: BLE001
+            l1_stats = {"enabled": True, "error": str(exc)}
+    return {
+        "l1": l1_stats,
+        "l2": l2_cache.stats(),
+        "l2_misconfigured": l2_cache_misconfigured,
+    }
+
+
+@app.post("/cache/purge")
+async def cache_purge() -> dict[str, Any]:
+    """Drop every L1 entry. L2 is a stub — no-op until the embedding client lands."""
+    cleared = 0
+    if l1_cache is not None:
+        try:
+            cleared = l1_cache.purge()  # type: ignore[union-attr]
+        except Exception:
+            cleared = 0
+    return {"l1_cleared": cleared}
+
+
+@app.get("/budget")
+async def budget() -> dict[str, Any]:
+    """Process-level cumulative usage + configured limits."""
+    return usage_budget.snapshot()
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def proxy(path: str, request: Request) -> Response:
     # Local endpoints are handled above, but keep a guard for accidental empty path.
@@ -354,6 +570,42 @@ async def proxy(path: str, request: Request) -> Response:
                 },
             },
         )
+
+    # X-Brain-Model-Hint: lets a client pin a request to a specific provider
+    # adapter without changing the body's `model` field. When the hint
+    # resolves to a not-yet-implemented adapter we fail loud with 501 so the
+    # operator notices instead of getting a confusing upstream error.
+    model_hint = request.headers.get("x-brain-model-hint")
+    if model_hint:
+        try:
+            adapter = select_adapter(model="", model_hint=model_hint)
+        except Exception:  # noqa: BLE001 — registry errors fall back to anthropic
+            adapter = None
+        if adapter is not None and adapter.name != "anthropic":
+            # Probe the adapter early; if it raises AdapterNotImplemented we
+            # short-circuit with 501. The IR doesn't matter because the
+            # adapter rejects regardless of payload.
+            from .providers.base import RequestIR
+
+            probe = RequestIR(payload={"model": ""}, headers={}, endpoint=path)
+            try:
+                adapter.translate_request(probe)
+            except AdapterNotImplemented as exc:
+                return JSONResponse(
+                    status_code=501,
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "adapter_not_implemented",
+                            "message": str(exc),
+                            "adapter": adapter.name,
+                        },
+                    },
+                )
+            # If translate_request did NOT raise, the operator wired a real
+            # adapter — but the integration glue for routing to non-anthropic
+            # upstreams ships in a follow-up. Fall through to anthropic for now.
+            request_headers["x-brain-resolved-adapter"] = adapter.name
 
     upstream_url = f"{settings.upstream}/{path}"
     if request.url.query:
@@ -479,13 +731,23 @@ async def proxy(path: str, request: Request) -> Response:
     # phase: SSE chunk-boundary replay deserves its own implementation.
     l1_status: str | None = None
     l1_key: str | None = None
-    cache_active = (
-        rt["l1_cache"]
-        and l1_cache is not None
-        and cache_lookup_payload is not None
+    l2_status: str | None = None
+    l2_similarity: float | None = None
+    cacheable = (
+        cache_lookup_payload is not None
         and method == "POST"
         and path.strip("/") == "v1/messages"
         and not cache_lookup_payload.get("stream", False)
+    )
+    cache_active = (
+        cacheable
+        and rt["l1_cache"]
+        and l1_cache is not None
+    )
+    l2_active = (
+        cacheable
+        and rt["l2_cache"]
+        and l2_cache.enabled
     )
     if cache_active:
         try:
@@ -522,6 +784,47 @@ async def proxy(path: str, request: Request) -> Response:
             )
         l1_status = "miss"
 
+    # L2 SEMANTIC CACHE LOOKUP on L1 miss. Embed the same canonical normalized
+    # JSON text that L1 hashed (keeps the two layers aligned on what "identical"
+    # means). The L2 hit is served byte-for-byte, same as L1.
+    if l2_active and (l1_status in (None, "miss")):
+        try:
+            embed_text = canonical_text(cache_lookup_payload)  # type: ignore[arg-type]
+            hit = l2_cache.get_similar(embed_text)
+        except Exception:
+            hit = None
+        if hit is not None:
+            l2_status = "hit"
+            l2_similarity = float(hit.similarity)
+            cached_headers = dict(hit.response.headers)
+            cached_headers["x-brain-l2-cache"] = "hit"
+            cached_headers["x-brain-l2-similarity"] = f"{l2_similarity:.4f}"
+            if l1_status is not None:
+                cached_headers["x-brain-l1-cache"] = l1_status
+            cached_headers.update(
+                _brain_headers(
+                    lingua_chars_saved=lingua_chars_saved,
+                    wall_auto_inserted=wall_auto_inserted,
+                )
+            )
+            audit_logger.record(
+                method=method,
+                path=path,
+                status_code=hit.response.status_code,
+                request_audit=request_audit,
+                request_id=cached_headers.get("request-id"),
+                latency_ms=(time.perf_counter() - started_perf) * 1000.0,
+                bytes_in=bytes_in,
+                bytes_out=len(hit.response.body),
+            )
+            return Response(
+                content=hit.response.body,
+                status_code=hit.response.status_code,
+                headers=cached_headers,
+                media_type=hit.response.media_type,
+            )
+        l2_status = "miss"
+
     try:
         if _is_streaming_messages(path, outgoing_content):
             return await _streaming_forward(
@@ -550,6 +853,8 @@ async def proxy(path: str, request: Request) -> Response:
         )
         if l1_status is not None:
             response_headers["x-brain-l1-cache"] = l1_status
+        if l2_status is not None:
+            response_headers["x-brain-l2-cache"] = l2_status
 
         response_content = upstream_response.content
         response_audit: CompressionAudit | None = None
@@ -568,6 +873,62 @@ async def proxy(path: str, request: Request) -> Response:
             except Exception:
                 response_audit = None
 
+        # COST TRACKING. Anthropic's usage block lives at the top level of a
+        # successful Messages response. We parse it once, look up the price,
+        # record to the tracker, and stamp x-brain-cost-usd on the outbound
+        # response. Failures here never propagate — cost is informational.
+        try:
+            if path.strip("/") == "v1/messages" and 200 <= upstream_response.status_code < 300:
+                response_payload_for_cost: dict[str, Any] | None = None
+                ct_lower = upstream_response.headers.get("content-type", "").lower()
+                if "application/json" in ct_lower and response_content:
+                    try:
+                        response_payload_for_cost = json.loads(response_content.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        response_payload_for_cost = None
+                if isinstance(response_payload_for_cost, dict):
+                    model_id = response_payload_for_cost.get("model")
+                    if not isinstance(model_id, str) or not model_id:
+                        # Fall back to the request body's model field — useful
+                        # when an adapter rewrote the response payload.
+                        try:
+                            req_payload = (
+                                cache_lookup_payload
+                                if cache_lookup_payload is not None
+                                else json.loads(body_bytes.decode("utf-8"))
+                            )
+                            if isinstance(req_payload, dict):
+                                model_id = str(req_payload.get("model") or "")
+                        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                            model_id = ""
+                    usage = extract_usage_from_anthropic(response_payload_for_cost)
+                    cost_record = estimate_cost(
+                        provider="anthropic",
+                        model=model_id or "",
+                        **usage,
+                    )
+                    cost_tracker.record(cost_record)
+                    if cost_record.matched:
+                        response_headers["x-brain-cost-usd"] = (
+                            f"{cost_record.usd:.6f}"
+                        )
+                    # Update the usage budget. The proxy doesn't count
+                    # cache-read tokens against the input quota — they're
+                    # already paid for upstream of the request.
+                    try:
+                        usage_budget.record(
+                            chars=int(bytes_in or 0),
+                            tokens=int(
+                                usage.get("input_tokens", 0)
+                                + usage.get("output_tokens", 0)
+                                + usage.get("cache_write_tokens", 0)
+                            ),
+                        )
+                    except (TypeError, ValueError):
+                        pass
+        except Exception:
+            pass
+
         audit_logger.record(
             method=method,
             path=path,
@@ -580,22 +941,30 @@ async def proxy(path: str, request: Request) -> Response:
             bytes_out=len(response_content) if response_content else 0,
         )
 
-        # L1 CACHE STORE: on a successful upstream response, populate the cache
-        # for next time. `l1_cache.put` filters status_code internally (only 2xx
-        # are stored) and strips auth-leaking headers defensively.
-        if cache_active and l1_key is not None and 200 <= upstream_response.status_code < 300:
-            try:
-                l1_cache.put(  # type: ignore[union-attr]
-                    l1_key,
-                    CachedResponse(
-                        status_code=upstream_response.status_code,
-                        headers=dict(response_headers),
-                        body=bytes(response_content) if response_content else b"",
-                        media_type=upstream_response.headers.get("content-type"),
-                    ),
-                )
-            except Exception:
-                pass  # cache store failure must never fail a request
+        # L1 + L2 CACHE STORE: on a successful upstream response, populate
+        # both layers. L1 stores by exact-match key; L2 stores by embedding of
+        # the same canonical normalized JSON. Both put() calls are best-effort.
+        if (cache_active or l2_active) and 200 <= upstream_response.status_code < 300 and cache_lookup_payload is not None:
+            cached_resp = CachedResponse(
+                status_code=upstream_response.status_code,
+                headers=dict(response_headers),
+                body=bytes(response_content) if response_content else b"",
+                media_type=upstream_response.headers.get("content-type"),
+            )
+            if cache_active and l1_key is not None:
+                try:
+                    l1_cache.put(l1_key, cached_resp)  # type: ignore[union-attr]
+                except Exception:
+                    pass
+            if l2_active:
+                try:
+                    # The L2 point_id mirrors the L1 key when available so the
+                    # two layers share a stable identity for the same content.
+                    point_id = l1_key or cache_key(cache_lookup_payload)
+                    embed_text = canonical_text(cache_lookup_payload)
+                    l2_cache.put_similar(embed_text, cached_resp, point_id=point_id)
+                except Exception:
+                    pass
 
         return Response(
             content=response_content,

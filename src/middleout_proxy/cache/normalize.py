@@ -76,6 +76,22 @@ def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def canonical_text(payload: dict[str, Any]) -> str:
+    """Return the canonical JSON string used by both L1 and L2 cache layers.
+
+    Exposed so the L2 layer can embed the *same* normalized text that L1 hashes,
+    keeping the two layers' notion of "identical" aligned.
+    """
+    normalized = normalize_payload(payload)
+    return json.dumps(
+        normalized,
+        separators=(",", ":"),
+        sort_keys=True,
+        ensure_ascii=False,
+        default=_json_default,
+    )
+
+
 def cache_key(payload: dict[str, Any]) -> str:
     """Return a SHA-256 hex digest of the canonical encoding of `payload`.
 
@@ -83,14 +99,7 @@ def cache_key(payload: dict[str, Any]) -> str:
     same key. Distinct payloads produce distinct keys with the cryptographic
     collision-resistance of SHA-256.
     """
-    normalized = normalize_payload(payload)
-    encoded = json.dumps(
-        normalized,
-        separators=(",", ":"),
-        sort_keys=True,
-        ensure_ascii=False,
-        default=_json_default,
-    ).encode("utf-8")
+    encoded = canonical_text(payload).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -102,4 +111,4 @@ def _json_default(o: Any) -> Any:
     return repr(o)
 
 
-__all__ = ["cache_key", "normalize_payload"]
+__all__ = ["cache_key", "canonical_text", "normalize_payload"]

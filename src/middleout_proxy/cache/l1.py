@@ -216,6 +216,26 @@ class L1Cache:
         except sqlite3.Error:
             pass
 
+    def purge(self) -> int:
+        """Drop every entry and return the count cleared.
+
+        Equivalent to :meth:`clear` but returns the size of the wipe so the
+        admin endpoint can report it. Storage errors swallow the count back
+        to zero rather than raising — the operator can re-check via
+        :meth:`stats` if they want to confirm.
+        """
+        try:
+            (before,) = self._conn.execute(
+                "SELECT COUNT(*) FROM l1_cache"
+            ).fetchone()
+        except sqlite3.Error:
+            return 0
+        try:
+            self._conn.execute("DELETE FROM l1_cache")
+        except sqlite3.Error:
+            return 0
+        return int(before)
+
     def close(self) -> None:
         try:
             self._conn.close()

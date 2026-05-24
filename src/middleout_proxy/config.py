@@ -364,6 +364,34 @@ class Settings:
     l2_similarity_threshold: float = field(default_factory=lambda: _float_env(
         "BRAIN_L2_SIMILARITY", _toml_default("l2_similarity_threshold", 0.97)
     ))
+    # L2 backend selection. "in_memory" is stdlib-only, bounded by
+    # l2_max_entries. "qdrant" requires the qdrant-client package + URL/key.
+    l2_backend: str = field(default_factory=lambda: os.getenv(
+        "BRAIN_L2_BACKEND", _toml_default("l2_backend", "in_memory")
+    ))
+    l2_max_entries: int = field(default_factory=lambda: _int_env(
+        "BRAIN_L2_MAX_ENTRIES", _toml_default("l2_max_entries", 10_000)
+    ))
+    l2_qdrant_url: str = field(default_factory=lambda: os.getenv(
+        "BRAIN_L2_QDRANT_URL", _toml_default("l2_qdrant_url", "")
+    ))
+    l2_qdrant_collection: str = field(default_factory=lambda: os.getenv(
+        "BRAIN_L2_QDRANT_COLLECTION", _toml_default("l2_qdrant_collection", "brain_proxy_l2")
+    ))
+    l2_qdrant_api_key: str = field(default_factory=lambda: os.getenv(
+        "BRAIN_L2_QDRANT_API_KEY", _toml_default("l2_qdrant_api_key", "")
+    ))
+    # L2 embedder selection. "hash" is stdlib, deterministic, NOT semantic.
+    # "openai" calls the OpenAI Embeddings API and needs OPENAI_API_KEY.
+    l2_embedder: str = field(default_factory=lambda: os.getenv(
+        "BRAIN_L2_EMBEDDER", _toml_default("l2_embedder", "hash")
+    ))
+    l2_embedding_dim: int = field(default_factory=lambda: _int_env(
+        "BRAIN_L2_EMBEDDING_DIM", _toml_default("l2_embedding_dim", 3072)
+    ))
+    l2_openai_model: str = field(default_factory=lambda: os.getenv(
+        "BRAIN_L2_OPENAI_MODEL", _toml_default("l2_openai_model", "text-embedding-3-large")
+    ))
 
     # Local LRU cache for deterministic post-JL compression output. Independent of
     # Anthropic's native cache; only avoids local CPU work on repeated text.
@@ -474,6 +502,18 @@ def load_settings() -> Settings:
         raise ValueError("BRAIN_LINGUA_RATIO must be between 0.05 and 0.95")
     if not 0.0 <= settings.l2_similarity_threshold <= 1.0:
         raise ValueError("BRAIN_L2_SIMILARITY must be between 0.0 and 1.0")
+    if settings.l2_backend not in {"in_memory", "qdrant"}:
+        raise ValueError(
+            "BRAIN_L2_BACKEND must be one of in_memory/qdrant, "
+            f"got {settings.l2_backend!r}"
+        )
+    if settings.l2_embedder not in {"hash", "openai"}:
+        raise ValueError(
+            "BRAIN_L2_EMBEDDER must be one of hash/openai, "
+            f"got {settings.l2_embedder!r}"
+        )
+    if settings.l2_embedding_dim < 16:
+        raise ValueError("BRAIN_L2_EMBEDDING_DIM must be >= 16")
     return settings
 
 

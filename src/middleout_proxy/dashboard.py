@@ -186,6 +186,26 @@ footer .ts{font-family:var(--mono)}
 .lat-tiles .cell{padding:14px 16px}
 .lat-tiles .cv{font-size:22px}
 
+/* --- brain (Phase 2/3/4) --- */
+.brain-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:900px){.brain-grid{grid-template-columns:1fr}}
+.kpi-row{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--border);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:14px}
+.kpi-row .cell{padding:14px 16px}
+.kpi-row .cv{font-size:22px}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:11.5px;font-family:var(--mono);background:var(--surface-2);color:var(--sub);border:1px solid var(--border-2);margin:2px 4px 2px 0}
+.chip.on{color:var(--green);border-color:rgba(63,185,80,.32);background:rgba(63,185,80,.08)}
+.chip.warn{color:var(--amber);border-color:rgba(245,158,11,.32);background:rgba(245,158,11,.08)}
+.chip.off{color:var(--muted)}
+.cost-bars{display:flex;flex-direction:column;gap:8px;min-height:80px;margin-top:8px}
+.cb{display:grid;grid-template-columns:160px 1fr auto;gap:10px;align-items:center;font-size:13px}
+.cb .cbn{font-family:var(--mono);color:var(--sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cb .cbbar{position:relative;height:6px;background:var(--border);border-radius:3px;overflow:hidden}
+.cb .cbbarfill{height:100%;background:linear-gradient(90deg,var(--blue),var(--cyan));border-radius:3px;transition:width .35s var(--ease);width:0%}
+.cb .cbv{font-family:var(--mono);color:var(--text);font-variant-numeric:tabular-nums}
+
+/* --- keyboard hint --- */
+.kbd{font-family:var(--mono);font-size:11px;padding:2px 6px;border-radius:4px;background:var(--surface-2);border:1px solid var(--border-2);color:var(--sub);box-shadow:0 1px 0 var(--border-2)}
+
 </style>
 </head>
 <body>
@@ -240,6 +260,43 @@ footer .ts{font-family:var(--mono)}
   <div>Hits <b id="ch-hits">-</b> &nbsp;&middot;&nbsp; Misses <b id="ch-misses">-</b> &nbsp;&middot;&nbsp; Size <b id="ch-size">-</b></div>
   <div><span class="badge subtle" id="ch-preserve" data-tip-pos="top" data-tip="When ON, proxy refuses to mutate any block&#10;at-or-before an Anthropic cache_control marker.&#10;Keeps upstream prompt cache valid.">anthropic-cache: -</span></div>
   </div>
+  </div>
+</section>
+
+<section>
+  <div class="sh">Brain &middot; Phase 2/3/4</div>
+  <div class="kpi-row">
+    <div class="cell" data-tip="Total spend tracked across all providers&#10;based on token usage and per-model pricing."><div class="cl">Total spend</div><div class="cv" id="b-cost">-</div></div>
+    <div class="cell" data-tip="Total requests with cost attribution."><div class="cl">Costed requests</div><div class="cv" id="b-creq">-</div></div>
+    <div class="cell" data-tip="Requests where no pricing entry matched the&#10;requested model (cost = 0 for these)."><div class="cl">Unmatched models</div><div class="cv" id="b-cunm">-</div></div>
+  </div>
+  <div class="brain-grid">
+    <div class="card">
+      <div class="brow">
+        <div><div class="cl">Cost by model</div></div>
+        <div style="text-align:right"><div class="cl" style="justify-content:flex-end">Top 6</div></div>
+      </div>
+      <div class="cost-bars" id="b-cost-bars">
+        <div class="nodata" style="font-family:var(--sans);color:var(--muted);font-style:italic;padding:8px 0">No costed traffic yet.</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="brow">
+        <div data-tip="Two-tier response cache state.&#10;L1 = SHA256 exact-match.&#10;L2 = embedding similarity (Qdrant)."><div class="cl">Response cache</div></div>
+        <div style="text-align:right"><span class="chip" id="b-l1">L1 -</span><span class="chip" id="b-l2">L2 -</span></div>
+      </div>
+      <div class="bsub" style="margin-top:8px">
+        <div>L2 lookups <b id="b-l2-lk">-</b> &middot; hits <b id="b-l2-hit">-</b> &middot; threshold <b id="b-l2-th">-</b></div>
+      </div>
+      <div class="brow" style="margin-top:14px">
+        <div data-tip="Adapter scaffolds available for routing.&#10;Use X-Brain-Model-Hint header to override."><div class="cl">Providers</div></div>
+        <div style="text-align:right" data-tip-pos="left" data-tip="Budget cap (chars/tokens). Once exceeded,&#10;requests still flow but counter is flagged."><div class="cl" style="justify-content:flex-end">Budget</div></div>
+      </div>
+      <div class="bsub" style="margin-top:6px">
+        <div id="b-providers"><span class="chip off">-</span></div>
+        <div><span class="chip" id="b-budget">-</span></div>
+      </div>
+    </div>
   </div>
 </section>
 
@@ -362,7 +419,7 @@ footer .ts{font-family:var(--mono)}
 
 <footer>
   <div class="v"><b>middleout-claude-proxy</b> &middot; <span id="ver">v0.2.0</span></div>
-  <div>updated <span class="ts" id="ts">-</span></div>
+  <div data-tip="Press R to refresh, I for input compression,&#10;O for output compression, J for JL dedupe,&#10;C for caveman.">shortcuts: <span class="kbd">R</span> <span class="kbd">I</span> <span class="kbd">O</span> <span class="kbd">J</span> <span class="kbd">C</span> &middot; updated <span class="ts" id="ts">-</span></div>
 </footer>
 
 <script>
@@ -683,6 +740,76 @@ async function refreshObservability(){
 refreshObservability();
 setInterval(refreshObservability,3000);
 window.addEventListener('resize',()=>{const c=document.getElementById('o-chart-saved');if(c){c.width=0;refreshObservability();}});
+
+// --- brain (Phase 2/3/4) ---
+function fmtUsd(v){if(v==null||isNaN(v))return'-';if(v<0.0001)return '$0';if(v<0.01)return '$'+v.toFixed(4);if(v<1)return '$'+v.toFixed(3);return '$'+v.toFixed(2)}
+function escHtml(s){return String(s).replace(/[<>&"]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;","\"":"&quot;"})[c])}
+
+function renderCostBars(byModel){
+  const wrap=document.getElementById('b-cost-bars');if(!wrap)return;
+  const entries=Object.entries(byModel||{}).filter(([,v])=>(v.usd||0)>0).sort((a,b)=>(b[1].usd||0)-(a[1].usd||0)).slice(0,6);
+  if(entries.length===0){wrap.innerHTML='<div class="nodata" style="font-family:var(--sans);color:var(--muted);font-style:italic;padding:8px 0">No costed traffic yet.</div>';return;}
+  const max=entries[0][1].usd||1;
+  const html=entries.map(([model,row])=>{
+    const w=Math.max(2,Math.round((row.usd/max)*100));
+    return '<div class="cb"><div class="cbn" title="'+escHtml(model)+'">'+escHtml(model)+'</div><div class="cbbar"><div class="cbbarfill" style="width:'+w+'%"></div></div><div class="cbv">'+fmtUsd(row.usd)+'</div></div>';
+  });
+  wrap.innerHTML=html.join('');
+}
+
+async function refreshBrain(){
+  try{
+    const [cost,cache,providers]=await Promise.all([
+      fetch('/cost').then(r=>r.json()).catch(()=>({total_usd:0,total_requests:0,unmatched_requests:0,by_model:{},budget:{}})),
+      fetch('/cache/stats').then(r=>r.json()).catch(()=>({l1:{enabled:false},l2:{enabled:false}})),
+      fetch('/providers').then(r=>r.json()).catch(()=>({adapters:[]})),
+    ]);
+    setVal('b-cost',fmtUsd(cost.total_usd||0));
+    setVal('b-creq',fmt(cost.total_requests||0));
+    setVal('b-cunm',fmt(cost.unmatched_requests||0));
+    renderCostBars(cost.by_model||{});
+
+    const l1El=document.getElementById('b-l1');
+    if(l1El){const on=!!(cache.l1&&cache.l1.enabled);l1El.textContent='L1 '+(on?'on':'off');l1El.className='chip '+(on?'on':'off');}
+    const l2El=document.getElementById('b-l2');
+    if(l2El){const on=!!(cache.l2&&cache.l2.enabled);const mis=!!cache.l2_misconfigured;l2El.textContent='L2 '+(mis?'misconfig':(on?'on':'off'));l2El.className='chip '+(mis?'warn':(on?'on':'off'));}
+    setVal('b-l2-lk',fmt((cache.l2&&cache.l2.lookups)||0));
+    setVal('b-l2-hit',fmt((cache.l2&&cache.l2.hits)||0));
+    const thr=cache.l2&&cache.l2.threshold;setVal('b-l2-th',thr!=null?thr.toFixed(2):'-');
+
+    const pWrap=document.getElementById('b-providers');
+    if(pWrap){
+      const list=(providers.adapters||[]);
+      pWrap.innerHTML=list.length?list.map(n=>'<span class="chip">'+escHtml(n)+'</span>').join(''):'<span class="chip off">none</span>';
+    }
+    const bEl=document.getElementById('b-budget');
+    if(bEl){
+      const b=cost.budget||{};
+      const cap=b.char_limit||b.token_limit;
+      if(!cap){bEl.textContent='no cap';bEl.className='chip off';}
+      else{
+        const used=b.chars_used||b.tokens_used||0;
+        const pct=cap>0?Math.min(100,Math.round((used/cap)*100)):0;
+        const lbl=b.char_limit?(used+' / '+cap+' chars'):(used+' / '+cap+' tokens');
+        bEl.textContent=lbl+' ('+pct+'%)';
+        bEl.className='chip '+(b.exceeded?'warn':'on');
+      }
+    }
+  }catch(e){}
+}
+refreshBrain();
+setInterval(refreshBrain,5000);
+
+// --- keyboard shortcuts ---
+document.addEventListener('keydown',ev=>{
+  if(ev.target&&['INPUT','TEXTAREA'].includes(ev.target.tagName))return;
+  const k=ev.key.toLowerCase();
+  if(k==='r'){ev.preventDefault();refreshStats();refreshHealth();refreshSettings();refreshObservability();refreshBrain();}
+  else if(k==='i'){ev.preventDefault();const t=document.getElementById('t-input_compression');if(t)t.click();}
+  else if(k==='o'){ev.preventDefault();const t=document.getElementById('t-output_compression');if(t)t.click();}
+  else if(k==='j'){ev.preventDefault();const t=document.getElementById('t-jl_dedupe');if(t)t.click();}
+  else if(k==='c'){ev.preventDefault();const t=document.getElementById('t-caveman');if(t)t.click();}
+});
 
 </script>
 </body>

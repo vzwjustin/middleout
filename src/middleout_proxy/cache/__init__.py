@@ -17,18 +17,25 @@ default. Streaming requests are NOT cached in this phase — SSE chunk boundary
 preservation is non-trivial and a separate follow-up.
 """
 
+from .embedders import HashEmbedder, OpenAIEmbeddingClient
 from .l1 import CachedResponse, L1Cache
 from .l2 import EmbeddingClient, L2Cache, L2NotConfigured, SemanticHit, VectorStore
-from .normalize import cache_key, normalize_payload
+from .normalize import cache_key, canonical_text, normalize_payload
+from .vector_stores import InMemoryVectorStore, QdrantVectorStore
 
 __all__ = [
     "CachedResponse",
     "EmbeddingClient",
+    "HashEmbedder",
+    "InMemoryVectorStore",
     "L1Cache",
     "L2Cache",
     "L2NotConfigured",
+    "OpenAIEmbeddingClient",
+    "QdrantVectorStore",
     "SemanticHit",
     "VectorStore",
     "cache_key",
+    "canonical_text",
     "normalize_payload",
 ]

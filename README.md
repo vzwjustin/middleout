@@ -177,6 +177,91 @@ pip install -e '.[dev]'
 pytest
 ```
 
+## Brain proxy — Phase 2/3/4 (cache, providers, cost)
+
+Phase 1 (cache-aware compression + transparent passthrough) is the legacy core
+above. The rest of the codebase scaffolds the "all-in-1 brain" surface area
+described in `CLAUDE.md`:
+
+- **Cache wall enforcement** (`cache_wall.py`, `volatile.py`) — parses cache
+  control breakpoints, refuses to mutate anything left of the wall. Auto-insert
+  is opt-in via `BRAIN_AUTO_INSERT_WALL`.
+- **LLMLingua-2** (`lingua.py`) — opt-in compression of the volatile tail.
+  Requires `pip install -e '.[lingua]'` (downloads a ~200MB BERT model on
+  first use). Configure with `BRAIN_LINGUA_ENABLED`, `BRAIN_LINGUA_RATIO`.
+- **L1 exact-match response cache** (`cache/l1.py`) — SQLite-backed,
+  bounded entries with LRU eviction. Key = SHA-256 of normalized post-compression
+  payload. Off by default; enable with `BRAIN_L1_CACHE_ENABLED=true`.
+- **L2 semantic response cache** (`cache/l2.py`) — embedding-based ANN lookup.
+  Backends: in-memory (default) or Qdrant (`pip install -e '.[qdrant]'`).
+  Embedders: `hash` (deterministic stdlib pseudo-embedder, default) or
+  `openai` (`pip install -e '.[openai]'`, needs `OPENAI_API_KEY`).
+- **Provider adapters** (`providers/`) — Anthropic identity adapter ships;
+  OpenAI, Gemini, Ollama are scaffolded and respond with `501 adapter_not_implemented`
+  when targeted via `X-Brain-Model-Hint`. The proxy's IR *is* the Anthropic
+  Messages schema.
+- **Cost tracker** (`cost.py`) — bakes in per-million-token prices for
+  Anthropic/OpenAI/Gemini models. Stamps `x-brain-cost-usd` on every successful
+  `/v1/messages` response and exposes `/cost`, `/cost/reset`, `/budget`.
+- **Rate-limit & budget hooks** (`rate_limit.py`, `budget.py`) — operator can
+  set char/token caps that flag exceeded requests in `/budget`.
+
+### Brain endpoints
+
+| Path                | Description                                          |
+| ------------------- | ---------------------------------------------------- |
+| `GET  /healthz`     | Lifespan + phase + provider list + cache wiring      |
+| `GET  /stats`       | Audit + cache + compression counters                 |
+| `GET  /metrics`     | Prometheus-format snapshot                           |
+| `POST /preview`     | Dry-run compression sizing (never touches the wire)  |
+| `GET  /cost`        | Cumulative spend by model + budget snapshot          |
+| `POST /cost/reset`  | Zero the cost counters                               |
+| `GET  /providers`   | Registered adapters + routing rules                  |
+| `GET  /cache/stats` | L1 + L2 cache state                                  |
+| `POST /cache/purge` | Drop every L1 entry                                  |
+| `GET  /budget`      | Process-level budget snapshot                        |
+| `GET  /dashboard`   | Live HTML dashboard (engines, cost, cache, traffic)  |
+
+### TOML config (Phase 1 spec)
+
+Settings can live in a `middleout.toml` file. Lookup order:
+
+1. `MIDDLEOUT_CONFIG` env var (explicit path)
+2. `./middleout.toml`
+3. `~/.config/middleout/middleout.toml`
+
+Env vars still override the TOML defaults. See `config.py:_TOML_FIELD_MAP` for
+the full schema; example:
+
+```toml
+[server]
+host = "127.0.0.1"
+port = 8787
+
+[lingua]
+enabled = true
+ratio = 0.5
+
+[l1_cache]
+enabled = true
+db_path = ".middleout-logs/l1.sqlite"
+
+[l2_cache]
+enabled = true
+similarity_threshold = 0.97
+```
+
+### Provider routing
+
+A client can pin a request to a specific adapter via header:
+
+```bash
+curl -H 'X-Brain-Model-Hint: openai/gpt-4o' ...
+```
+
+Adapter selection is exposed via `GET /providers`; only the Anthropic adapter
+currently round-trips end-to-end. Non-Anthropic hints respond `501`.
+
 ## Files
 
 ```text

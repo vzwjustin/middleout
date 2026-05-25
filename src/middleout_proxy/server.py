@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request, Response
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from .adaptive import decide_levels as _adaptive_decide_levels
@@ -126,6 +126,8 @@ def _build_l2_cache(s: Settings) -> tuple["L2Cache", str | None]:
                 embedding_client=embedder,
                 vector_store=store,
                 similarity_threshold=s.l2_similarity_threshold,
+                top_k=s.l2_top_k,
+                margin=s.l2_margin,
             ),
             None,
         )
@@ -139,6 +141,8 @@ def _build_l2_cache(s: Settings) -> tuple["L2Cache", str | None]:
                 embedding_client=None,
                 vector_store=None,
                 similarity_threshold=s.l2_similarity_threshold,
+                top_k=s.l2_top_k,
+                margin=s.l2_margin,
                 enabled=False,
             ),
             f"{type(e).__name__}: {e}",
@@ -155,9 +159,14 @@ l2_cache_misconfigured: bool = (
 # tracker survives across process lifetime but never persists to disk.
 cost_tracker = CostTracker()
 
-# Usage budget. Limits are operator-controlled; default = unlimited so
-# the tracker is informational only.
-usage_budget = UsageBudget(char_limit=None, token_limit=None)
+# Usage budget. Limits read from settings; default = unlimited so the tracker
+# is informational only. When `settings.budget_enforce` is true AND a limit is
+# set, the request-handler returns 429 once the running total crosses the
+# limit — see `_check_budget`.
+usage_budget = UsageBudget(
+    char_limit=settings.budget_char_limit,
+    token_limit=settings.budget_token_limit,
+)
 
 # Policy router (per-model, per-endpoint overrides). Pulls from
 # `MIDDLEOUT_POLICIES` (JSON) at startup. Errors surface as a startup
@@ -296,6 +305,41 @@ app = FastAPI(
 app.state.http = None
 
 
+def _require_admin(request: Request) -> None:
+    """Gate an admin endpoint behind ``MIDDLEOUT_ADMIN_TOKEN``.
+
+    When the env var is unset the dependency is a no-op (loopback-only
+    deployments stay frictionless). When set, every request to a gated route
+    must present ``Authorization: Bearer <token>``; constant-time comparison
+    keeps timing-side-channels off the table.
+    """
+    expected = settings.admin_token.strip()
+    if not expected:
+        return  # admin token disabled — endpoints are open as before
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise _AdminAuthError("admin endpoint requires Authorization: Bearer <token>")
+    presented = auth[len("Bearer "):].strip()
+    import hmac
+    if not hmac.compare_digest(presented, expected):
+        raise _AdminAuthError("invalid admin token")
+
+
+class _AdminAuthError(Exception):
+    """Raised by `_require_admin` when an admin endpoint refuses a request."""
+
+
+@app.exception_handler(_AdminAuthError)
+async def _admin_auth_exception_handler(_request: Request, exc: _AdminAuthError) -> JSONResponse:
+    return JSONResponse(
+        status_code=401,
+        content={
+            "type": "error",
+            "error": {"type": "admin_auth_error", "message": str(exc)},
+        },
+    )
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, Any]:
     return {
@@ -329,6 +373,10 @@ async def healthz() -> dict[str, Any]:
         "api_key_injection": False,
         "api_key_headers_rejected": True,
         "api_keys_supported": False,
+        "admin_token_required": bool(settings.admin_token),
+        "budget_enforce": settings.budget_enforce,
+        "budget_char_limit": settings.budget_char_limit,
+        "budget_token_limit": settings.budget_token_limit,
         "providers": sorted(PROVIDER_REGISTRY.keys()),
         "rate_limit_enabled": _runtime["rate_limit"],
         "rate_limit_capacity": request_limiter.capacity,
@@ -337,7 +385,7 @@ async def healthz() -> dict[str, Any]:
     }
 
 
-@app.get("/stats")
+@app.get("/stats", dependencies=[Depends(_require_admin)])
 async def stats() -> dict[str, Any]:
     snap = audit_logger.stats.snapshot()
     snap["result_cache"] = compressor.result_cache.stats()
@@ -352,7 +400,7 @@ async def stats() -> dict[str, Any]:
     return snap
 
 
-@app.get("/stats/timeseries")
+@app.get("/stats/timeseries", dependencies=[Depends(_require_admin)])
 async def stats_timeseries() -> dict[str, Any]:
     """Rolling 1-minute buckets, oldest -> newest, for the last window_minutes.
 
@@ -366,14 +414,14 @@ async def stats_timeseries() -> dict[str, Any]:
     }
 
 
-@app.get("/stats/recent")
+@app.get("/stats/recent", dependencies=[Depends(_require_admin)])
 async def stats_recent(n: int = 50) -> dict[str, Any]:
     """Last N audit records (hashes + stats only — NEVER raw payload text)."""
     n = max(0, min(int(n), audit_logger.stats.recent_max))
     return {"count": n, "items": audit_logger.stats.recent(n)}
 
 
-@app.get("/settings")
+@app.get("/settings", dependencies=[Depends(_require_admin)])
 async def get_settings() -> dict[str, Any]:
     return dict(_runtime)
 
@@ -401,7 +449,7 @@ def _snapshot_runtime() -> dict[str, Any]:
     }
 
 
-@app.post("/settings")
+@app.post("/settings", dependencies=[Depends(_require_admin)])
 async def post_settings(request: Request) -> Response:
     try:
         body = await request.json()
@@ -500,7 +548,7 @@ async def dashboard() -> HTMLResponse:
 # --- Brain endpoints (preview, metrics, cost, providers, cache admin) -------
 
 
-@app.post("/preview")
+@app.post("/preview", dependencies=[Depends(_require_admin)])
 async def preview(request: Request) -> JSONResponse:
     """Dry-run compression: pass a request payload, get sizes/savings/audit.
 
@@ -540,7 +588,7 @@ async def preview(request: Request) -> JSONResponse:
     return JSONResponse(content=result)
 
 
-@app.get("/metrics", response_class=PlainTextResponse)
+@app.get("/metrics", response_class=PlainTextResponse, dependencies=[Depends(_require_admin)])
 async def metrics() -> PlainTextResponse:
     """Prometheus-format snapshot of audit + cache + cost counters."""
     snap = audit_logger.stats.snapshot()
@@ -549,7 +597,7 @@ async def metrics() -> PlainTextResponse:
     return PlainTextResponse(content=body, media_type="text/plain; version=0.0.4")
 
 
-@app.get("/cost")
+@app.get("/cost", dependencies=[Depends(_require_admin)])
 async def cost() -> dict[str, Any]:
     """Cumulative cost snapshot: USD by model, total requests, unmatched count."""
     snap = cost_tracker.snapshot()
@@ -557,7 +605,7 @@ async def cost() -> dict[str, Any]:
     return snap
 
 
-@app.post("/cost/reset")
+@app.post("/cost/reset", dependencies=[Depends(_require_admin)])
 async def cost_reset() -> dict[str, Any]:
     """Zero the cost tracker counters AND the usage budget counters.
 
@@ -570,20 +618,20 @@ async def cost_reset() -> dict[str, Any]:
     return {"reset": True, "total_usd": 0.0, "budget_reset": True}
 
 
-@app.post("/budget/reset")
+@app.post("/budget/reset", dependencies=[Depends(_require_admin)])
 async def budget_reset() -> dict[str, Any]:
     """Zero just the usage budget counters. Cost tracker is left untouched."""
     usage_budget.reset()
     return {"reset": True, "budget": usage_budget.snapshot()}
 
 
-@app.get("/providers")
+@app.get("/providers", dependencies=[Depends(_require_admin)])
 async def providers() -> dict[str, Any]:
     """Snapshot of registered provider adapters + routing rules."""
     return _routes_snapshot()
 
 
-@app.get("/cache/stats")
+@app.get("/cache/stats", dependencies=[Depends(_require_admin)])
 async def cache_stats() -> dict[str, Any]:
     """Current L1 + L2 cache state for the operator."""
     l1_stats: dict[str, Any] = {"enabled": False}
@@ -600,7 +648,7 @@ async def cache_stats() -> dict[str, Any]:
     }
 
 
-@app.post("/cache/purge")
+@app.post("/cache/purge", dependencies=[Depends(_require_admin)])
 async def cache_purge() -> dict[str, Any]:
     """Drop every L1 entry. L2 is a stub — no-op until the embedding client lands."""
     cleared = 0
@@ -612,13 +660,13 @@ async def cache_purge() -> dict[str, Any]:
     return {"l1_cleared": cleared}
 
 
-@app.get("/budget")
+@app.get("/budget", dependencies=[Depends(_require_admin)])
 async def budget() -> dict[str, Any]:
     """Process-level cumulative usage + configured limits."""
     return usage_budget.snapshot()
 
 
-@app.get("/rate-limit")
+@app.get("/rate-limit", dependencies=[Depends(_require_admin)])
 async def rate_limit() -> dict[str, Any]:
     """Per-client token-bucket state. Buckets are keyed on a hash of each
     client's Authorization header; raw tokens never appear here. Tracking is
@@ -634,7 +682,7 @@ async def rate_limit() -> dict[str, Any]:
     return snap
 
 
-@app.get("/policies")
+@app.get("/policies", dependencies=[Depends(_require_admin)])
 async def policies_route() -> dict[str, Any]:
     """Current per-(model, endpoint) compression policy router config."""
     rules_out = []
@@ -788,6 +836,32 @@ async def proxy(path: str, request: Request) -> Response:
                         },
                     },
                 )
+
+    # USAGE BUDGET enforcement. The operator opts into this via
+    # `MIDDLEOUT_BUDGET_ENFORCE=1` together with a char_limit and/or token_limit.
+    # Default deployment is observe-only: usage_budget.record() still fires
+    # after each successful upstream completion, but nothing is rejected.
+    if settings.budget_enforce and usage_budget.exceeded():
+        snap = usage_budget.snapshot()
+        return JSONResponse(
+            status_code=429,
+            headers={
+                "retry-after": "60",
+                "x-brain-budget": "exceeded",
+            },
+            content={
+                "type": "error",
+                "error": {
+                    "type": "budget_exceeded_error",
+                    "message": (
+                        "MiddleOut proxy usage budget exhausted. "
+                        f"chars_used={snap['chars_used']} (limit={snap['char_limit']}), "
+                        f"tokens_used={snap['tokens_used']} (limit={snap['token_limit']}). "
+                        "Reset via POST /budget/reset."
+                    ),
+                },
+            },
+        )
 
     # Even when input compression is disabled, parse the body so the L1/L2
     # cache layers and the per-request model tag still have something to key

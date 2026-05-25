@@ -120,6 +120,8 @@ class L2Cache:
         vector_store: VectorStore | None = None,
         similarity_threshold: float = 0.97,
         enabled: bool = False,
+        top_k: int = 5,
+        margin: float = 0.02,
     ) -> None:
         if enabled and (embedding_client is None or vector_store is None):
             raise L2NotConfigured(
@@ -130,6 +132,12 @@ class L2Cache:
         self.vector_store = vector_store
         self.similarity_threshold = float(similarity_threshold)
         self.enabled = bool(enabled)
+        # Pull `top_k` candidates and only accept the top one if it beats
+        # the runner-up by at least `margin`. With `top_k=1` a near-tie
+        # between an exact match and a wrong-but-similar neighbour was
+        # decided by eviction order. The margin check forces clear winners.
+        self.top_k = max(1, int(top_k))
+        self.margin = max(0.0, float(margin))
         self.lookups = 0
         self.hits = 0
 
@@ -152,16 +160,27 @@ class L2Cache:
         try:
             self.lookups += 1
             vec = self.embedding_client.embed(normalized_payload_text)
-            results = self.vector_store.search(vec, top_k=1)
+            results = self.vector_store.search(vec, top_k=self.top_k)
         except Exception as e:  # noqa: BLE001 — fail-soft
             logger.warning("L2 lookup failed: %s: %s", type(e).__name__, e)
             return None
         if not results:
             return None
+        # Sort results defensively — most stores already return descending by
+        # similarity, but we don't want to depend on that.
+        results = sorted(results, key=lambda r: r[1], reverse=True)
         point_id, similarity, metadata = results[0]
         eff_threshold = self.similarity_threshold if threshold is None else float(threshold)
         if similarity < eff_threshold:
             return None
+        # Margin gate: when several candidates are above threshold, the top
+        # match must dominate the next-best by `margin`. Otherwise we treat
+        # the lookup as a miss to avoid serving a wrong-but-similar response
+        # for a near-tie.
+        if len(results) >= 2:
+            runner_up = results[1][1]
+            if similarity - runner_up < self.margin:
+                return None
         response = _metadata_to_response(metadata)
         if response is None:
             return None
@@ -199,6 +218,8 @@ class L2Cache:
             "lookups": self.lookups,
             "hits": self.hits,
             "threshold": self.similarity_threshold,
+            "top_k": self.top_k,
+            "margin": self.margin,
             "embedding_dim": getattr(self.embedding_client, "dim", None),
         }
 

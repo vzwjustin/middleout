@@ -89,7 +89,12 @@ def compress(text: str, *, level: str = "standard") -> EngineResult:
         run = j - i
         if run >= threshold:
             omitted = run - 2
-            marker = f"[... {omitted} identical lines collapsed ...]"
+            # At `lite` level the keys ARE the raw lines, so the run is
+            # byte-identical. At `standard`/`aggressive` the keys are
+            # normalised (timestamps stripped / numbers folded) so the run
+            # is only similar; say so honestly in the marker.
+            descriptor = "identical" if level == "lite" else "similar"
+            marker = f"[... {omitted} {descriptor} lines collapsed ...]"
             proposed = "\n".join((lines[i], marker, lines[j - 1]))
             original = "\n".join(lines[i:j])
             if len(proposed) < len(original):

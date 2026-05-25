@@ -92,6 +92,11 @@ class ProxyStats:
         self._recent: deque = deque(maxlen=max(1, self.recent_max))
         self._latency_global_counts: list[int] = [0] * (len(LATENCY_BINS_MS) + 1)
         self._latency_global_total: int = 0
+        # Floor the retention window at one minute. `window_minutes=0` would
+        # set the eviction cutoff at `int(now)` itself, dropping every bucket
+        # the moment it's created and zeroing the timeseries endpoint.
+        if self.window_minutes < 1:
+            self.window_minutes = 1
         # Guards all reads (snapshot/timeseries/recent) and writes (observe)
         # so a reader can't iterate self._buckets / self.engines_total mid
         # mutation. AuditLogger holds its own outer _lock; this is a nested
@@ -341,6 +346,15 @@ class AuditLogger:
         )
 
         if self._log_path:
+            # CLAUDE.md contract: audit JSONL logs hashes + stats only unless
+            # `MIDDLEOUT_LOG_TEXT_SAMPLES=true`. Use the same sanitizer the
+            # /stats/recent buffer uses so the two surfaces stay symmetric.
+            if not bool(getattr(self.settings, "log_text_samples", False)):
+                jsonl_request_summary = _sanitize_audit_summary(request_summary)
+                jsonl_response_summary = _sanitize_audit_summary(response_summary)
+            else:
+                jsonl_request_summary = request_summary
+                jsonl_response_summary = response_summary
             entry = {
                 "ts": now if now is not None else time.time(),
                 "method": method,
@@ -351,8 +365,8 @@ class AuditLogger:
                 "ms": round(latency, 2),
                 "bytes_in": int(bytes_in),
                 "bytes_out": int(bytes_out),
-                "request_compression": request_summary,
-                "response_compression": response_summary,
+                "request_compression": jsonl_request_summary,
+                "response_compression": jsonl_response_summary,
                 "error": error,
             }
             # Serialize JSONL appends under a dedicated IO lock. POSIX only

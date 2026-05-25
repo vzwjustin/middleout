@@ -78,7 +78,9 @@ def test_lite_only_collapses_byte_identical_runs():
 
 def test_standard_collapses_timestamp_runs():
     result = compress(_FIXTURE, level="standard")
-    assert "[... 10 identical lines collapsed ...]" in result.text
+    # At standard level the run is similar-after-timestamp-strip, not byte
+    # identical, so the marker honestly says "similar".
+    assert "[... 10 similar lines collapsed ...]" in result.text
     # First and last of each run are preserved verbatim.
     assert "2023-01-15 10:30:45 INFO request received from client" in result.text
     assert "2023-01-15 10:30:56 INFO request received from client" in result.text

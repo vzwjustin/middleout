@@ -136,6 +136,11 @@ class QdrantVectorStore:
     require running a Qdrant container in CI, which is out of scope here.
     """
 
+    # L2Cache thresholds and the margin gate both assume cosine similarity
+    # in [0, 1]. Dot product / Euclidean would return raw magnitudes that
+    # break those checks silently. Reject mis-configurations early.
+    _SUPPORTED_DISTANCES: frozenset[str] = frozenset({"Cosine"})
+
     def __init__(
         self,
         *,
@@ -147,6 +152,12 @@ class QdrantVectorStore:
         distance: str = "Cosine",
         collection_create_if_missing: bool = True,
     ) -> None:
+        if distance not in self._SUPPORTED_DISTANCES:
+            raise ValueError(
+                f"QdrantVectorStore distance must be one of "
+                f"{sorted(self._SUPPORTED_DISTANCES)} (the L2 threshold + margin "
+                f"are calibrated for cosine), got {distance!r}."
+            )
         try:
             from qdrant_client import QdrantClient  # type: ignore[import-not-found]
             from qdrant_client.http import models as qmodels  # type: ignore[import-not-found]

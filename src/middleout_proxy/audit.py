@@ -92,40 +92,57 @@ class ProxyStats:
         self._recent: deque = deque(maxlen=max(1, self.recent_max))
         self._latency_global_counts: list[int] = [0] * (len(LATENCY_BINS_MS) + 1)
         self._latency_global_total: int = 0
+        # Floor the retention window at one minute. `window_minutes=0` would
+        # set the eviction cutoff at `int(now)` itself, dropping every bucket
+        # the moment it's created and zeroing the timeseries endpoint.
+        if self.window_minutes < 1:
+            self.window_minutes = 1
+        # Guards all reads (snapshot/timeseries/recent) and writes (observe)
+        # so a reader can't iterate self._buckets / self.engines_total mid
+        # mutation. AuditLogger holds its own outer _lock; this is a nested
+        # but bounded inner lock — every method body is non-blocking.
+        self._lock = Lock()
 
     def snapshot(self) -> dict[str, Any]:
-        return {
-            "started_at": self.started_at,
-            "requests_total": self.requests_total,
-            "compressed_requests": self.compressed_requests,
-            "chars_saved_in": self.chars_saved_in,
-            "chars_saved_out": self.chars_saved_out,
-            "upstream_errors": self.upstream_errors,
-            "cache_hits": self.cache_hits,
-            "cache_misses": self.cache_misses,
-            "protected_blocks": self.protected_blocks,
-            "bytes_in_total": self.bytes_in_total,
-            "bytes_out_total": self.bytes_out_total,
-            "engines_total": dict(self.engines_total),
-            "uptime_s": round(time.time() - self.started_at, 3),
-            "p50_ms": round(
-                _quantile_from_hist(self._latency_global_counts, self._latency_global_total, 0.50),
-                2,
-            ),
-            "p95_ms": round(
-                _quantile_from_hist(self._latency_global_counts, self._latency_global_total, 0.95),
-                2,
-            ),
-        }
+        with self._lock:
+            return {
+                "started_at": self.started_at,
+                "requests_total": self.requests_total,
+                "compressed_requests": self.compressed_requests,
+                "chars_saved_in": self.chars_saved_in,
+                "chars_saved_out": self.chars_saved_out,
+                "upstream_errors": self.upstream_errors,
+                "cache_hits": self.cache_hits,
+                "cache_misses": self.cache_misses,
+                "protected_blocks": self.protected_blocks,
+                "bytes_in_total": self.bytes_in_total,
+                "bytes_out_total": self.bytes_out_total,
+                "engines_total": dict(self.engines_total),
+                "uptime_s": round(time.time() - self.started_at, 3),
+                "p50_ms": round(
+                    _quantile_from_hist(
+                        list(self._latency_global_counts), self._latency_global_total, 0.50
+                    ),
+                    2,
+                ),
+                "p95_ms": round(
+                    _quantile_from_hist(
+                        list(self._latency_global_counts), self._latency_global_total, 0.95
+                    ),
+                    2,
+                ),
+            }
 
     def timeseries(self, *, now: float | None = None) -> list[dict[str, Any]]:
-        self._evict(now=now)
-        return [self._buckets[k].to_dict() for k in sorted(self._buckets.keys())]
+        with self._lock:
+            self._evict(now=now)
+            return [self._buckets[k].to_dict() for k in sorted(self._buckets.keys())]
 
     def recent(self, n: int) -> list[dict[str, Any]]:
         if n <= 0:
             return []
-        items = list(self._recent)
+        with self._lock:
+            items = list(self._recent)
         return items[-n:]
 
     def observe(
@@ -148,60 +165,61 @@ class ProxyStats:
         now: float | None = None,
     ) -> None:
         ts = time.time() if now is None else now
-        self.requests_total += 1
-        if chars_saved_in or chars_saved_out:
-            self.compressed_requests += 1
-        self.chars_saved_in += chars_saved_in
-        self.chars_saved_out += chars_saved_out
-        self.bytes_in_total += max(0, int(bytes_in))
-        self.bytes_out_total += max(0, int(bytes_out))
-        if is_error:
-            self.upstream_errors += 1
-        for engine, saved in engines.items():
-            if saved <= 0:
-                continue
-            self.engines_total[engine] = self.engines_total.get(engine, 0) + int(saved)
+        with self._lock:
+            self.requests_total += 1
+            if chars_saved_in or chars_saved_out:
+                self.compressed_requests += 1
+            self.chars_saved_in += chars_saved_in
+            self.chars_saved_out += chars_saved_out
+            self.bytes_in_total += max(0, int(bytes_in))
+            self.bytes_out_total += max(0, int(bytes_out))
+            if is_error:
+                self.upstream_errors += 1
+            for engine, saved in engines.items():
+                if saved <= 0:
+                    continue
+                self.engines_total[engine] = self.engines_total.get(engine, 0) + int(saved)
 
-        idx = _bin_index(max(0.0, float(latency_ms)))
-        self._latency_global_counts[idx] += 1
-        self._latency_global_total += 1
+            idx = _bin_index(max(0.0, float(latency_ms)))
+            self._latency_global_counts[idx] += 1
+            self._latency_global_total += 1
 
-        bucket = self._bucket_for(ts)
-        bucket.requests += 1
-        if is_error:
-            bucket.errors += 1
-        bucket.chars_saved_in += chars_saved_in
-        bucket.chars_saved_out += chars_saved_out
-        bucket.bytes_in += max(0, int(bytes_in))
-        bucket.bytes_out += max(0, int(bytes_out))
-        for engine, saved in engines.items():
-            if saved <= 0:
-                continue
-            bucket.engines[engine] = bucket.engines.get(engine, 0) + int(saved)
-        bucket.latency_counts[idx] += 1
-        bucket.latency_total += 1
+            bucket = self._bucket_for(ts)
+            bucket.requests += 1
+            if is_error:
+                bucket.errors += 1
+            bucket.chars_saved_in += chars_saved_in
+            bucket.chars_saved_out += chars_saved_out
+            bucket.bytes_in += max(0, int(bytes_in))
+            bucket.bytes_out += max(0, int(bytes_out))
+            for engine, saved in engines.items():
+                if saved <= 0:
+                    continue
+                bucket.engines[engine] = bucket.engines.get(engine, 0) + int(saved)
+            bucket.latency_counts[idx] += 1
+            bucket.latency_total += 1
 
-        self._recent.append(
-            {
-                "ts": ts,
-                "method": method,
-                "path": path,
-                "status_code": status_code,
-                "ms": round(float(latency_ms), 2),
-                "chars_saved_in": chars_saved_in,
-                "chars_saved_out": chars_saved_out,
-                "bytes_in": int(bytes_in),
-                "bytes_out": int(bytes_out),
-                "engines": dict(engines),
-                "request_id": request_id,
-                "is_error": bool(is_error),
-                "model": model,
-                "request_audit": _sanitize_audit_summary(request_audit_summary),
-                "response_audit": _sanitize_audit_summary(response_audit_summary),
-            }
-        )
+            self._recent.append(
+                {
+                    "ts": ts,
+                    "method": method,
+                    "path": path,
+                    "status_code": status_code,
+                    "ms": round(float(latency_ms), 2),
+                    "chars_saved_in": chars_saved_in,
+                    "chars_saved_out": chars_saved_out,
+                    "bytes_in": int(bytes_in),
+                    "bytes_out": int(bytes_out),
+                    "engines": dict(engines),
+                    "request_id": request_id,
+                    "is_error": bool(is_error),
+                    "model": model,
+                    "request_audit": _sanitize_audit_summary(request_audit_summary),
+                    "response_audit": _sanitize_audit_summary(response_audit_summary),
+                }
+            )
 
-        self._evict(now=ts)
+            self._evict(now=ts)
 
     def _bucket_for(self, ts: float) -> _Bucket:
         minute_ts = int(ts) - (int(ts) % 60)
@@ -256,6 +274,13 @@ class AuditLogger:
             recent_max=int(getattr(settings, "recent_max", 200)),
         )
         self._lock = Lock()
+        # Dedicated IO lock so JSONL appends never interleave when the line
+        # exceeds PIPE_BUF (4 KiB on Linux) — POSIX only guarantees atomic
+        # appends up to that threshold, and a fully-populated audit entry
+        # with multiple events plus 500-byte text samples blows past it.
+        # Separate from `_lock` so stats updates aren't serialized behind
+        # disk fsync.
+        self._io_lock = Lock()
         self._log_path: Path | None = None
         if settings.audit_enabled:
             settings.audit_log_dir.mkdir(parents=True, exist_ok=True)
@@ -289,7 +314,10 @@ class AuditLogger:
         request_summary = request_audit.to_dict() if request_audit else None
         response_summary = response_audit.to_dict() if response_audit else None
 
-        with self._lock:
+        # ProxyStats has its own internal lock; pre-increment counters under
+        # the same lock the observe() call uses so readers see a coherent
+        # snapshot instead of partially-updated stats.
+        with self.stats._lock:
             self.stats.cache_hits += request_audit.cache_hits if request_audit else 0
             self.stats.cache_misses += request_audit.cache_misses if request_audit else 0
             self.stats.protected_blocks += (
@@ -299,25 +327,34 @@ class AuditLogger:
                 self.stats.cache_hits += response_audit.cache_hits
                 self.stats.cache_misses += response_audit.cache_misses
 
-            self.stats.observe(
-                method=method,
-                path=path,
-                status_code=status_code,
-                chars_saved_in=chars_saved_in,
-                chars_saved_out=chars_saved_out,
-                engines=engines,
-                latency_ms=latency,
-                bytes_in=bytes_in,
-                bytes_out=bytes_out,
-                request_id=request_id,
-                is_error=is_error,
-                request_audit_summary=request_summary,
-                response_audit_summary=response_summary,
-                model=model,
-                now=now,
-            )
+        self.stats.observe(
+            method=method,
+            path=path,
+            status_code=status_code,
+            chars_saved_in=chars_saved_in,
+            chars_saved_out=chars_saved_out,
+            engines=engines,
+            latency_ms=latency,
+            bytes_in=bytes_in,
+            bytes_out=bytes_out,
+            request_id=request_id,
+            is_error=is_error,
+            request_audit_summary=request_summary,
+            response_audit_summary=response_summary,
+            model=model,
+            now=now,
+        )
 
         if self._log_path:
+            # CLAUDE.md contract: audit JSONL logs hashes + stats only unless
+            # `MIDDLEOUT_LOG_TEXT_SAMPLES=true`. Use the same sanitizer the
+            # /stats/recent buffer uses so the two surfaces stay symmetric.
+            if not bool(getattr(self.settings, "log_text_samples", False)):
+                jsonl_request_summary = _sanitize_audit_summary(request_summary)
+                jsonl_response_summary = _sanitize_audit_summary(response_summary)
+            else:
+                jsonl_request_summary = request_summary
+                jsonl_response_summary = response_summary
             entry = {
                 "ts": now if now is not None else time.time(),
                 "method": method,
@@ -328,22 +365,23 @@ class AuditLogger:
                 "ms": round(latency, 2),
                 "bytes_in": int(bytes_in),
                 "bytes_out": int(bytes_out),
-                "request_compression": request_summary,
-                "response_compression": response_summary,
+                "request_compression": jsonl_request_summary,
+                "response_compression": jsonl_response_summary,
                 "error": error,
             }
-            # FIX F (bug-hunter): serialize OUTSIDE the stats lock and rely on
-            # POSIX append-atomicity for small lines (<PIPE_BUF, typically 4 KiB).
-            # The prior code held _lock through disk I/O, which serialized every
-            # request audit behind any other request's fsync. Now the lock only
-            # protects in-memory counters; concurrent record() calls all append
-            # to the file simultaneously.
+            # Serialize JSONL appends under a dedicated IO lock. POSIX only
+            # guarantees atomic append for writes <= PIPE_BUF (4 KiB on Linux);
+            # an audit entry carrying multiple events with text samples can
+            # easily exceed that and interleave with a concurrent writer. The
+            # stats lock is separate so disk fsync doesn't serialize counter
+            # updates.
             line = json.dumps(entry, ensure_ascii=False) + "\n"
-            try:
-                with self._log_path.open("a", encoding="utf-8") as f:
-                    f.write(line)
-            except OSError:
-                pass  # never fail the request because audit disk write failed
+            with self._io_lock:
+                try:
+                    with self._log_path.open("a", encoding="utf-8") as f:
+                        f.write(line)
+                except OSError:
+                    pass  # never fail the request because audit disk write failed
 
         if getattr(self.settings, "log_json", False):
             structured = {

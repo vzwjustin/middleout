@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -104,6 +105,12 @@ class L1Cache:
         self.db_path = str(db_path)
         self.max_entries = int(max_entries)
         self.max_body_bytes = int(max_body_bytes)
+        # `sqlite3.Connection` is not safe for concurrent statement execution
+        # across threads even with check_same_thread=False; guard every call
+        # with a Python-level lock so multi-threaded callers cannot interleave
+        # cursors. The lock is fine-grained — each operation completes in
+        # microseconds for small payloads.
+        self._lock = threading.Lock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -116,31 +123,32 @@ class L1Cache:
 
     def get(self, key: str) -> CachedResponse | None:
         """Return the cached response for `key`, or None on miss/error."""
-        try:
-            cur = self._conn.execute(
-                "SELECT status_code, headers_json, body, media_type, inserted_at, "
-                "last_hit_at, hit_count FROM l1_cache WHERE cache_key = ?",
-                (key,),
-            )
-            row = cur.fetchone()
-        except sqlite3.Error:
-            return None
-        if row is None:
-            return None
-        status_code, headers_json, body, media_type, inserted_at, _, hit_count = row
-        try:
-            headers = json.loads(headers_json)
-        except json.JSONDecodeError:
-            return None
-        now = time.time()
-        try:
-            self._conn.execute(
-                "UPDATE l1_cache SET last_hit_at = ?, hit_count = hit_count + 1 "
-                "WHERE cache_key = ?",
-                (now, key),
-            )
-        except sqlite3.Error:
-            pass  # don't fail the read on a stat-update failure
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "SELECT status_code, headers_json, body, media_type, inserted_at, "
+                    "last_hit_at, hit_count FROM l1_cache WHERE cache_key = ?",
+                    (key,),
+                )
+                row = cur.fetchone()
+            except sqlite3.Error:
+                return None
+            if row is None:
+                return None
+            status_code, headers_json, body, media_type, inserted_at, _, hit_count = row
+            try:
+                headers = json.loads(headers_json)
+            except json.JSONDecodeError:
+                return None
+            now = time.time()
+            try:
+                self._conn.execute(
+                    "UPDATE l1_cache SET last_hit_at = ?, hit_count = hit_count + 1 "
+                    "WHERE cache_key = ?",
+                    (now, key),
+                )
+            except sqlite3.Error:
+                pass  # don't fail the read on a stat-update failure
         return CachedResponse(
             status_code=int(status_code),
             headers=headers,
@@ -160,7 +168,13 @@ class L1Cache:
         - Bodies larger than `max_body_bytes`
         - Headers containing auth-leaking entries (defensive — stripped first)
         """
-        if not 200 <= response.status_code < 300:
+        # Anthropic Messages only returns 200 on success. Refuse any other
+        # 2xx (204 No Content, 206 Partial, etc.) — these almost certainly
+        # indicate a misbehaving intermediary and caching them locks in an
+        # empty/bogus body.
+        if response.status_code != 200:
+            return
+        if not response.body:
             return
         if len(response.body) > self.max_body_bytes:
             return
@@ -172,36 +186,38 @@ class L1Cache:
         }
         headers_json = json.dumps(clean_headers, ensure_ascii=False, sort_keys=True)
         now = time.time()
-        try:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO l1_cache "
-                "(cache_key, status_code, headers_json, body, media_type, "
-                " inserted_at, last_hit_at, hit_count, body_bytes) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    key,
-                    int(response.status_code),
-                    headers_json,
-                    bytes(response.body),
-                    response.media_type,
-                    now,
-                    now,
-                    0,
-                    len(response.body),
-                ),
-            )
-            self._evict_if_over()
-        except sqlite3.Error:
-            return
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO l1_cache "
+                    "(cache_key, status_code, headers_json, body, media_type, "
+                    " inserted_at, last_hit_at, hit_count, body_bytes) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        key,
+                        int(response.status_code),
+                        headers_json,
+                        bytes(response.body),
+                        response.media_type,
+                        now,
+                        now,
+                        0,
+                        len(response.body),
+                    ),
+                )
+                self._evict_if_over_locked()
+            except sqlite3.Error:
+                return
 
     def stats(self) -> dict[str, Any]:
-        try:
-            row = self._conn.execute(
-                "SELECT COUNT(*), COALESCE(SUM(body_bytes), 0), "
-                "COALESCE(SUM(hit_count), 0) FROM l1_cache"
-            ).fetchone()
-        except sqlite3.Error:
-            return {"entries": 0, "body_bytes": 0, "total_hits": 0}
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(body_bytes), 0), "
+                    "COALESCE(SUM(hit_count), 0) FROM l1_cache"
+                ).fetchone()
+            except sqlite3.Error:
+                return {"entries": 0, "body_bytes": 0, "total_hits": 0}
         return {
             "entries": int(row[0]),
             "body_bytes": int(row[1]),
@@ -211,10 +227,11 @@ class L1Cache:
         }
 
     def clear(self) -> None:
-        try:
-            self._conn.execute("DELETE FROM l1_cache")
-        except sqlite3.Error:
-            pass
+        with self._lock:
+            try:
+                self._conn.execute("DELETE FROM l1_cache")
+            except sqlite3.Error:
+                pass
 
     def purge(self) -> int:
         """Drop every entry and return the count cleared.
@@ -224,28 +241,30 @@ class L1Cache:
         to zero rather than raising — the operator can re-check via
         :meth:`stats` if they want to confirm.
         """
-        try:
-            (before,) = self._conn.execute(
-                "SELECT COUNT(*) FROM l1_cache"
-            ).fetchone()
-        except sqlite3.Error:
-            return 0
-        try:
-            self._conn.execute("DELETE FROM l1_cache")
-        except sqlite3.Error:
-            return 0
+        with self._lock:
+            try:
+                (before,) = self._conn.execute(
+                    "SELECT COUNT(*) FROM l1_cache"
+                ).fetchone()
+            except sqlite3.Error:
+                return 0
+            try:
+                self._conn.execute("DELETE FROM l1_cache")
+            except sqlite3.Error:
+                return 0
         return int(before)
 
     def close(self) -> None:
-        try:
-            self._conn.close()
-        except sqlite3.Error:
-            pass
+        with self._lock:
+            try:
+                self._conn.close()
+            except sqlite3.Error:
+                pass
 
     # -- internals --------------------------------------------------------
 
-    def _evict_if_over(self) -> None:
-        """LRU-by-last_hit eviction down to `max_entries`.
+    def _evict_if_over_locked(self) -> None:
+        """LRU-by-last_hit eviction down to `max_entries`. Caller holds the lock.
 
         Cheap when we're under the cap (one COUNT query). Expensive only when
         we just crossed the cap (one DELETE with a subquery).

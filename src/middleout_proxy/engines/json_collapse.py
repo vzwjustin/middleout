@@ -105,8 +105,18 @@ class _Collapser:
             head_keys = keys[:5]
             tail_keys = keys[-3:]
             omitted = len(keys) - 8
+            # Pick a marker key that won't collide with an existing key in the
+            # source. Otherwise a head_keys[0]==_OMITTED_KEY or a
+            # tail_keys entry of the same name would either be shadowed or
+            # silently overwrite the omission signal.
+            marker_key = _OMITTED_KEY
+            suffix = 0
+            existing = set(head_keys) | set(tail_keys)
+            while marker_key in existing:
+                suffix += 1
+                marker_key = f"{_OMITTED_KEY}_{suffix}"
             result: dict = {k: walked[k] for k in head_keys}
-            result[_OMITTED_KEY] = _Marker(
+            result[marker_key] = _Marker(
                 f"[... {omitted} keys omitted ...]"
             )
             for k in tail_keys:
@@ -138,7 +148,15 @@ def compress(text: str, *, level: str = "standard") -> EngineResult:
 
     arr_th, obj_th = _level_config(level)
     collapser = _Collapser(arr_th, obj_th)
-    new_struct = collapser.walk(parsed)
+    try:
+        new_struct = collapser.walk(parsed)
+    except RecursionError:
+        # Adversarial deeply-nested JSON can exhaust Python's recursion limit
+        # even though `json.loads` accepted it. Fall back to identity rather
+        # than crashing the engine pipeline.
+        return EngineResult(
+            text=text, original_chars=len(text), compressed_chars=len(text)
+        )
 
     if collapser.collapses == 0:
         return EngineResult(

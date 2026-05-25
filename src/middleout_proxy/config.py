@@ -64,6 +64,17 @@ def _int_env(name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer, got {value!r}") from exc
 
 
+def _optional_int_env(name: str, default: int | None) -> int | None:
+    """Like ``_int_env`` but ``None`` means "no limit"."""
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+
+
 def _float_env(name: str, default: float) -> float:
     value = os.getenv(name)
     if value is None or value.strip() == "":
@@ -216,6 +227,30 @@ class Settings:
         "MIDDLEOUT_RELOAD", _toml_default("reload", False)
     ))
 
+    # Admin endpoint token. When set, every admin route (/settings POST,
+    # /cache/purge, /cost/reset, /budget/reset, /preview, /stats*, /metrics,
+    # /providers, /policies, /rate-limit, /cost, /budget, /cache/stats) must
+    # carry `Authorization: Bearer <token>`. /healthz, /v1/messages, and the
+    # rest of the upstream passthrough are unaffected. Recommended whenever
+    # the proxy binds to anything other than loopback.
+    admin_token: str = field(default_factory=lambda: os.getenv(
+        "MIDDLEOUT_ADMIN_TOKEN", _toml_default("admin_token", "")
+    ))
+
+    # Cumulative usage budget. When either limit is set AND budget_enforce is
+    # true, requests are rejected with 429 once the running total crosses the
+    # limit. Default behavior is observe-only — counters update on every
+    # request but nothing is blocked, so existing deployments don't change.
+    budget_char_limit: int | None = field(default_factory=lambda: _optional_int_env(
+        "MIDDLEOUT_BUDGET_CHAR_LIMIT", _toml_default("budget_char_limit", None)
+    ))
+    budget_token_limit: int | None = field(default_factory=lambda: _optional_int_env(
+        "MIDDLEOUT_BUDGET_TOKEN_LIMIT", _toml_default("budget_token_limit", None)
+    ))
+    budget_enforce: bool = field(default_factory=lambda: _bool_env(
+        "MIDDLEOUT_BUDGET_ENFORCE", _toml_default("budget_enforce", False)
+    ))
+
     # Never use ANTHROPIC_BASE_URL here; Claude Code points that to this proxy.
     upstream_base_url: str = field(default_factory=lambda: os.getenv(
         "PROXY_UPSTREAM_BASE_URL",
@@ -363,6 +398,15 @@ class Settings:
     ))
     l2_similarity_threshold: float = field(default_factory=lambda: _float_env(
         "BRAIN_L2_SIMILARITY", _toml_default("l2_similarity_threshold", 0.97)
+    ))
+    # Fetch this many ANN candidates and only serve when the best beats the
+    # runner-up by `l2_margin`. Defends against near-ties from a long shared
+    # prefix that pushes unrelated prompts above the threshold.
+    l2_top_k: int = field(default_factory=lambda: _int_env(
+        "BRAIN_L2_TOP_K", _toml_default("l2_top_k", 5)
+    ))
+    l2_margin: float = field(default_factory=lambda: _float_env(
+        "BRAIN_L2_MARGIN", _toml_default("l2_margin", 0.02)
     ))
     # L2 backend selection. "in_memory" is stdlib-only, bounded by
     # l2_max_entries. "qdrant" requires the qdrant-client package + URL/key.

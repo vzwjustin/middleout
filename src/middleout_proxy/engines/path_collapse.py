@@ -27,8 +27,10 @@ from .base import EngineResult, make_result, validate_level
 NAME = "path_collapse"
 
 # Per spec: optional drive letter prefix, then >= 2 ``/segment`` segments.
-# A segment may contain word chars, dots, hyphens and spaces.
-_PATH_RE = re.compile(r"(?:[A-Za-z]:)?(?:/[\w.\- ]+){2,}")
+# A segment may contain word chars, dots and hyphens. Spaces are NOT included
+# in the segment class — otherwise ``/a/b/c and /d/e/f`` would match as one
+# spuriously-long path containing prose.
+_PATH_RE = re.compile(r"(?:[A-Za-z]:)?(?:/[\w.\-]+){2,}")
 
 
 def _level_config(level: str) -> tuple[int, int]:

@@ -45,8 +45,10 @@ _JS_BARE_RE = re.compile(
 )
 
 # Rust backtrace frame: '   12: my_crate::my_fn'
+# Require at least one ``::`` so plain numbered prose lists (``1: alpha``,
+# ``2: beta``) don't get mistaken for stack frames at aggressive level.
 _RUST_FRAME_RE = re.compile(
-    r"^\s*\d+:\s+(?P<func>[\w:<>$]+(?:::[\w:<>$]+)*)\s*$"
+    r"^\s*\d+:\s+(?P<func>[\w<>$]+(?:::[\w<>$]+)+)\s*$"
 )
 
 # A marker we emit; recognized so the aggressive pass can include them when

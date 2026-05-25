@@ -131,7 +131,7 @@ def test_get_similar_misses_when_below_threshold() -> None:
 
 def test_get_similar_swallows_embedding_errors() -> None:
     class _Broken(_StubEmbedder):
-        def embed(self, text: str) -> list[float]:  # noqa: ARG002
+        def embed(self, text: str) -> list[float]:
             raise RuntimeError("embed failed")
 
     cache = L2Cache(
@@ -196,7 +196,7 @@ def test_put_similar_writes_when_enabled() -> None:
 
 def test_put_similar_swallows_errors() -> None:
     class _BrokenStore(_StubVectorStore):
-        def upsert(self, *args: Any, **kwargs: Any) -> None:  # noqa: ARG002
+        def upsert(self, *args: Any, **kwargs: Any) -> None:
             raise RuntimeError("upsert failed")
 
     cache = L2Cache(

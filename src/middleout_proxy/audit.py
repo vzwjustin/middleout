@@ -31,7 +31,7 @@ def _bin_index(latency_ms: float) -> int:
 def _quantile_from_hist(counts: list[int], total: int, q: float) -> float:
     if total <= 0:
         return 0.0
-    target = max(1, int(math.ceil(q * total)))
+    target = max(1, math.ceil(q * total))
     cum = 0
     for i, c in enumerate(counts):
         cum += c

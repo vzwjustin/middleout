@@ -39,6 +39,9 @@ def preview_compression(
     jl_dedupe: bool = True,
     caveman: dict | None = None,
     rtk: dict | None = None,
+    input_compression: bool | None = None,
+    json_aware: dict | None = None,
+    lsh: dict | None = None,
 ) -> dict[str, Any]:
     """Run compression against ``payload`` and return a structured summary.
 
@@ -47,14 +50,20 @@ def preview_compression(
 
     Args:
         payload: The Anthropic Messages request body to preview. May be empty.
-        settings: A :class:`Settings` instance. The caller chooses whether to
-            enable input compression — if ``settings.input_compression_enabled``
-            is False the preview will simply echo the payload with zero savings.
+        settings: A :class:`Settings` instance. When ``input_compression`` is
+            ``None`` (the default) the preview honors
+            ``settings.input_compression_enabled``; pass an explicit bool to
+            force the preview to reflect the live runtime toggle instead.
         jl_dedupe: Override for JL-style local dedupe (matches
             :meth:`PayloadCompressor.compress_request_payload`).
         caveman: Optional caveman engine override, same shape as the runtime
             dict in ``server.py`` (``{"enabled": bool, "level": str}``).
         rtk: Optional RTK engine override, same shape.
+        input_compression: Optional explicit override of the input-compression
+            gate. ``True`` forces compression to run regardless of the static
+            setting; ``None`` falls back to ``settings.input_compression_enabled``.
+        json_aware: Optional JSON-aware engine override.
+        lsh: Optional LSH dedupe engine override.
 
     Returns:
         A dict with input/output sizes, percentage saved, audit events,
@@ -66,12 +75,23 @@ def preview_compression(
     input_chars = _serialize_chars(safe_payload)
 
     compressor = PayloadCompressor(settings)
+    # Decide the static-gate behavior: when the caller passes an explicit
+    # runtime override we honor it; otherwise we fall back to the configured
+    # setting so a baseline preview reflects the operator's defaults.
+    force = (
+        input_compression
+        if input_compression is not None
+        else settings.input_compression_enabled
+    )
     compressed_payload, audit = compressor.compress_request_payload(
         safe_payload,
         endpoint="preview",
         jl_dedupe=jl_dedupe,
         caveman=caveman,
         rtk=rtk,
+        json_aware=json_aware,
+        lsh=lsh,
+        force_enabled=bool(force),
     )
 
     output_chars = _serialize_chars(compressed_payload)

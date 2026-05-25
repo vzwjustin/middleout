@@ -87,7 +87,7 @@ class LinguaResult:
 
     @property
     def changed(self) -> bool:
-        return self.text != self._original or self.skipped_reason is None and self.chars_saved > 0
+        return self.text != self._original or (self.skipped_reason is None and self.chars_saved > 0)
 
     # `_original` is set by the compressor when constructing the result so that
     # `changed` can answer correctly even when chars_in == chars_out (e.g., the
@@ -161,7 +161,7 @@ class LinguaCompressor:
                 if self.device is not None:
                     kwargs["device_map"] = self.device
                 self._model = PromptCompressor(**kwargs)
-            except Exception as e:  # noqa: BLE001 — surface as LinguaUnavailable
+            except Exception as e:
                 err = LinguaUnavailable(
                     f"Could not load LLMLingua-2 model {self.model_id!r}: "
                     f"{type(e).__name__}: {e}"
@@ -219,7 +219,7 @@ class LinguaCompressor:
                     rate=eff_ratio,
                     force_tokens=["\n", "?", "!", "."],
                 )
-        except Exception as e:  # noqa: BLE001 — fail-soft
+        except Exception as e:
             logger.warning("LLMLingua-2 inference failed: %s: %s", type(e).__name__, e)
             return LinguaResult(
                 text, chars_in, chars_in, skipped_reason="inference_error", _original=original

@@ -26,7 +26,7 @@ class _StubLingua:
 
     transform: callable
 
-    def compress(self, text: str, *, ratio=None) -> LinguaResult:  # noqa: ARG002
+    def compress(self, text: str, *, ratio=None) -> LinguaResult:
         out = self.transform(text)
         return LinguaResult(
             text=out,

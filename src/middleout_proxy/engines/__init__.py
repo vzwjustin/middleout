@@ -56,10 +56,10 @@ def apply_engine(name: str, text: str, level: str = "standard") -> EngineResult:
 
 __all__ = [
     "ENGINE_NAMES",
-    "Engine",
-    "EngineResult",
     "LEVELS",
     "REGISTRY",
+    "Engine",
+    "EngineResult",
     "apply_engine",
     "comment_strip",
     "diff_compactor",

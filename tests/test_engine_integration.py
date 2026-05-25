@@ -134,7 +134,7 @@ def test_lsh_dedupes_near_duplicates_in_content_list() -> None:
             }
         ]
     }
-    out_off, _ = compressor.compress_request_payload(
+    _out_off, _ = compressor.compress_request_payload(
         payload, endpoint="v1/messages", lsh={"enabled": False, "level": "standard"}
     )
     out_on, audit_on = compressor.compress_request_payload(

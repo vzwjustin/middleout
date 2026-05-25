@@ -4,17 +4,17 @@ import hashlib
 import math
 import re
 from dataclasses import dataclass
-from typing import Iterable
+from collections.abc import Iterable
 
 __all__ = [
-    "tokenize",
-    "tokenize_words",
+    "BandedJLIndex",
+    "RequestSketchIndex",
+    "SketchRecord",
+    "cosine",
     "shingles",
     "signed_jl_projection",
-    "cosine",
-    "SketchRecord",
-    "RequestSketchIndex",
-    "BandedJLIndex",
+    "tokenize",
+    "tokenize_words",
 ]
 
 _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?|[^\s]")
@@ -47,7 +47,7 @@ def shingles(tokens: list[str], width: int) -> Iterable[str]:
 
 
 def _hash64(seed: str, value: str) -> int:
-    digest = hashlib.blake2b(f"{seed}\0{value}".encode("utf-8"), digest_size=8).digest()
+    digest = hashlib.blake2b(f"{seed}\0{value}".encode(), digest_size=8).digest()
     return int.from_bytes(digest, "big", signed=False)
 
 
@@ -80,7 +80,7 @@ def signed_jl_projection(
 def cosine(a: tuple[float, ...], b: tuple[float, ...]) -> float:
     if len(a) != len(b):
         raise ValueError("vectors must have the same dimensionality")
-    return sum(x * y for x, y in zip(a, b))
+    return sum(x * y for x, y in zip(a, b, strict=True))
 
 
 @dataclass

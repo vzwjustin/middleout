@@ -57,10 +57,10 @@ def estimate_tokens(text: str) -> int:
     upper_heavy = letters > 0 and (upper / letters) > 0.6
     symbol_heavy = punctuation > max(1, int(n * 0.3))
     if upper_heavy or symbol_heavy:
-        return max(1, int(round(n / 3.5)))
+        return max(1, round(n / 3.5))
 
     base = letters / 4.0 + digits / 2.0 + punctuation + ws_runs * 0.5
-    return max(1, int(round(base)))
+    return max(1, round(base))
 
 
 def estimate_tokens_for_payload(payload: dict[str, Any]) -> int:

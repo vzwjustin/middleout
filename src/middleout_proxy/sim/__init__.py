@@ -24,11 +24,11 @@ from .minhash import jaccard_estimate, minhash_signature
 from .simhash import hamming_distance, simhash64, simhash_similarity
 
 __all__ = [
-    "minhash_signature",
-    "jaccard_estimate",
-    "simhash64",
-    "hamming_distance",
-    "simhash_similarity",
-    "MinHashLSH",
     "HybridSketchIndex",
+    "MinHashLSH",
+    "hamming_distance",
+    "jaccard_estimate",
+    "minhash_signature",
+    "simhash64",
+    "simhash_similarity",
 ]

@@ -52,7 +52,12 @@ def _cache_field(stats: dict[str, Any], key: str, default: int = 0) -> int:
     return default
 
 
-def render_prometheus(stats: dict[str, Any], *, settings: Settings) -> str:
+def render_prometheus(
+    stats: dict[str, Any],
+    *,
+    settings: Settings,
+    runtime: dict[str, Any] | None = None,
+) -> str:
     """Render ``stats`` and ``settings`` to a Prometheus text-format payload.
 
     Args:
@@ -63,11 +68,25 @@ def render_prometheus(stats: dict[str, Any], *, settings: Settings) -> str:
             a ``result_cache`` sub-dict — both shapes are accepted.
         settings: Current :class:`Settings`. Used to expose configured
             toggles (input compression on/off, engine on/off, JL similarity).
+        runtime: Optional runtime snapshot from ``server._runtime``. When
+            provided, the per-engine gauges report the live state rather than
+            the startup configuration; the dashboard and operators can flip
+            engines at runtime without restarting the proxy. Missing keys
+            fall back to ``settings`` so partial dicts work.
 
     Returns:
         A newline-terminated Prometheus 0.0.4 text exposition body.
     """
     lines: list[str] = []
+
+    # Helper that reads `runtime` first, then falls back to a settings attr.
+    def _live(key: str, *, settings_attr: str) -> bool:
+        if runtime is not None and key in runtime:
+            value = runtime[key]
+            if isinstance(value, dict):
+                return bool(value.get("enabled", False))
+            return bool(value)
+        return bool(getattr(settings, settings_attr))
 
     def emit_counter(name: str, help_text: str, value: int) -> None:
         lines.append(f"# HELP {name} {help_text}")
@@ -154,7 +173,7 @@ def render_prometheus(stats: dict[str, Any], *, settings: Settings) -> str:
     emit_gauge(
         "middleout_input_compression_enabled",
         "Whether the named compression engine is enabled (1 = on, 0 = off).",
-        1 if settings.input_compression_enabled else 0,
+        1 if _live("input_compression", settings_attr="input_compression_enabled") else 0,
         labels={"engine": "input"},
     )
 
@@ -165,10 +184,14 @@ def render_prometheus(stats: dict[str, Any], *, settings: Settings) -> str:
     )
     lines.append("# TYPE middleout_engine_enabled gauge")
     engine_states: list[tuple[str, bool]] = [
-        ("caveman", settings.caveman_enabled),
-        ("rtk", settings.rtk_enabled),
-        ("jl_dedupe", settings.jl_dedupe_enabled),
-        ("output", settings.output_compression_enabled),
+        ("caveman", _live("caveman", settings_attr="caveman_enabled")),
+        ("rtk", _live("rtk", settings_attr="rtk_enabled")),
+        ("jl_dedupe", _live("jl_dedupe", settings_attr="jl_dedupe_enabled")),
+        ("output", _live("output_compression", settings_attr="output_compression_enabled")),
+        ("json_aware", _live("json_aware", settings_attr="json_aware_enabled")),
+        ("lsh", _live("lsh", settings_attr="lsh_enabled")),
+        ("adaptive", _live("adaptive", settings_attr="adaptive_enabled")),
+        ("lingua", _live("lingua", settings_attr="lingua_enabled")),
     ]
     for engine_name, enabled in engine_states:
         emit_gauge(

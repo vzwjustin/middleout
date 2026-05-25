@@ -34,13 +34,18 @@ from .base import (
 from .registry import REGISTRY, register, select_adapter
 
 # Eagerly import known adapter modules so they self-register on the registry.
-from . import anthropic, gemini, ollama, openai  # noqa: F401
+# The `as foo` aliases keep these intentionally-unused-side-effect imports
+# from being flagged as F401 by strict linters.
+from . import anthropic as anthropic  # noqa: PLC0414
+from . import gemini as gemini  # noqa: PLC0414
+from . import ollama as ollama  # noqa: PLC0414
+from . import openai as openai  # noqa: PLC0414
 
 __all__ = [
+    "REGISTRY",
     "Adapter",
     "AdapterError",
     "AdapterNotImplemented",
-    "REGISTRY",
     "RequestIR",
     "ResponseIR",
     "register",

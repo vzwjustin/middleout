@@ -47,7 +47,7 @@ def proxy_with_l1(monkeypatch):
             self.calls: list[dict[str, Any]] = []
             self.response: _FakeResponse | None = None
 
-        async def request(self, method, url, *, headers, content) -> _FakeResponse:  # noqa: ARG002
+        async def request(self, method, url, *, headers, content) -> _FakeResponse:
             self.calls.append({"method": method, "url": url, "content": content})
             assert self.response is not None, "test must set fake_http.response first"
             return self.response
@@ -65,13 +65,11 @@ def proxy_with_l1(monkeypatch):
 
 def _ok_response(body: dict) -> Any:
     """Helper to construct a fake upstream 200 JSON response."""
-    enc = json.dumps(body).encode("utf-8")
-    from tests.test_l1_integration import proxy_with_l1  # noqa: F401 — re-export for fixture resolution
-    return enc
+    return json.dumps(body).encode("utf-8")
 
 
 def test_second_identical_request_hits_l1_cache(proxy_with_l1) -> None:
-    client, fake_http, server = proxy_with_l1
+    client, fake_http, _server = proxy_with_l1
     payload = {"model": "claude-3-5-sonnet", "messages": [{"role": "user", "content": "hi"}]}
 
     # First request: upstream returns 200 → cache populated.
@@ -104,7 +102,7 @@ def test_second_identical_request_hits_l1_cache(proxy_with_l1) -> None:
 
 
 def test_streaming_request_bypasses_l1(proxy_with_l1) -> None:
-    client, fake_http, server = proxy_with_l1
+    client, fake_http, _server = proxy_with_l1
     payload = {
         "model": "claude-3-5-sonnet",
         "messages": [{"role": "user", "content": "hi"}],
@@ -126,7 +124,7 @@ def test_streaming_request_bypasses_l1(proxy_with_l1) -> None:
 
 
 def test_different_payloads_do_not_collide(proxy_with_l1) -> None:
-    client, fake_http, server = proxy_with_l1
+    client, fake_http, _server = proxy_with_l1
 
     body_a = json.dumps({"id": "A", "content": [{"type": "text", "text": "A"}]}).encode("utf-8")
     body_b = json.dumps({"id": "B", "content": [{"type": "text", "text": "B"}]}).encode("utf-8")
@@ -157,7 +155,7 @@ def test_different_payloads_do_not_collide(proxy_with_l1) -> None:
 
 def test_metadata_difference_still_hits_cache(proxy_with_l1) -> None:
     """Two requests differing only in `metadata` (user_id) must share the cache."""
-    client, fake_http, server = proxy_with_l1
+    client, fake_http, _server = proxy_with_l1
     body = json.dumps({"id": "shared", "content": [{"type": "text", "text": "x"}]}).encode("utf-8")
     fake_http.response = type(
         "R", (), {

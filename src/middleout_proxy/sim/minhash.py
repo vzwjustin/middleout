@@ -84,5 +84,5 @@ def jaccard_estimate(sig_a: tuple[int, ...], sig_b: tuple[int, ...]) -> float:
         )
     if not sig_a:
         return 0.0
-    matches = sum(1 for x, y in zip(sig_a, sig_b) if x == y)
+    matches = sum(1 for x, y in zip(sig_a, sig_b, strict=True) if x == y)
     return matches / len(sig_a)

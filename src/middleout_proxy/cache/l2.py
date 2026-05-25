@@ -153,7 +153,7 @@ class L2Cache:
             self.lookups += 1
             vec = self.embedding_client.embed(normalized_payload_text)
             results = self.vector_store.search(vec, top_k=1)
-        except Exception as e:  # noqa: BLE001 — fail-soft
+        except Exception as e:
             logger.warning("L2 lookup failed: %s: %s", type(e).__name__, e)
             return None
         if not results:
@@ -190,7 +190,7 @@ class L2Cache:
                 vector=vec,
                 payload=_response_to_metadata(response),
             )
-        except Exception as e:  # noqa: BLE001 — fail-soft
+        except Exception as e:
             logger.warning("L2 put failed: %s: %s", type(e).__name__, e)
 
     def stats(self) -> dict[str, Any]:

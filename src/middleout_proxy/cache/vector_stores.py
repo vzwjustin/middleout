@@ -37,7 +37,7 @@ def _cosine(a: list[float], b: list[float]) -> float:
     dot = 0.0
     a_norm = 0.0
     b_norm = 0.0
-    for ai, bi in zip(a, b):
+    for ai, bi in zip(a, b, strict=True):
         dot += ai * bi
         a_norm += ai * ai
         b_norm += bi * bi
@@ -174,7 +174,7 @@ class QdrantVectorStore:
                 collection_name=self.collection,
                 vectors_config=qm.VectorParams(size=self.dim, distance=qm.Distance[distance.upper()]),
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("Qdrant ensure_collection failed: %s: %s", type(e).__name__, e)
 
     def upsert(
@@ -223,7 +223,7 @@ class QdrantVectorStore:
                 "entries": int(getattr(info, "points_count", 0) or 0),
                 "dim": self.dim,
             }
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             return {
                 "backend": "qdrant",
                 "collection": self.collection,

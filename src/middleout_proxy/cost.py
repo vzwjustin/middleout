@@ -354,8 +354,8 @@ class CostTracker:
 
 
 __all__ = [
-    "CostTracker",
     "PRICE_TABLE",
+    "CostTracker",
     "PriceEntry",
     "RequestCost",
     "estimate",

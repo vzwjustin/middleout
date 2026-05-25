@@ -51,7 +51,7 @@ def proxy_with_l2(monkeypatch):
             self.calls = []
             self.response = _Resp(b'{"id":"m1","content":[{"type":"text","text":"reply"}]}')
 
-        async def request(self, method, url, *, headers, content):  # noqa: ARG002
+        async def request(self, method, url, *, headers, content):
             self.calls.append({"method": method, "url": url, "content": content})
             return self.response
 
@@ -95,7 +95,7 @@ def test_l2_miss_then_hit_on_identical_payload(proxy_with_l2) -> None:
 def test_l2_skips_below_threshold(proxy_with_l2) -> None:
     """A semantically different payload should miss the cache (well below
     the 0.95 cosine threshold for HashEmbedder with dim=256)."""
-    client, fake, l2 = proxy_with_l2
+    client, fake, _l2 = proxy_with_l2
     p1 = {"model": "x", "messages": [{"role": "user", "content": "tell me about cats and how they purr"}]}
     p2 = {"model": "x", "messages": [{"role": "user", "content": "explain quantum entanglement in detail"}]}
 
@@ -110,7 +110,7 @@ def test_l2_skips_below_threshold(proxy_with_l2) -> None:
 
 
 def test_l2_skips_streaming_requests(proxy_with_l2) -> None:
-    client, fake, _ = proxy_with_l2
+    client, _fake, _ = proxy_with_l2
     streaming_payload = {
         "model": "x",
         "messages": [{"role": "user", "content": "stream me"}],

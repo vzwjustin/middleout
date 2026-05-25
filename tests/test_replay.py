@@ -123,7 +123,7 @@ def test_rotation_drops_oldest_past_max_files(tmp_path):
 
 def test_purge_clears_directory(tmp_path):
     capture = RequestCapture(tmp_path, max_files=5)
-    for i in range(3):
+    for _i in range(3):
         time.sleep(0.002)
         capture.capture(
             method="GET",

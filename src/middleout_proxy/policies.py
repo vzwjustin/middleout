@@ -19,7 +19,8 @@ import fnmatch
 import json
 import os
 from dataclasses import dataclass, field, fields, replace
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 
 @dataclass(frozen=True)
@@ -134,7 +135,7 @@ class PolicyRouter:
         return self.default
 
     @classmethod
-    def from_env(cls, env: dict[str, str] | None = None) -> "PolicyRouter":
+    def from_env(cls, env: dict[str, str] | None = None) -> PolicyRouter:
         """Build a router from the ``MIDDLEOUT_POLICIES`` JSON env var.
 
         An empty / unset variable yields an empty router with the default
@@ -147,7 +148,7 @@ class PolicyRouter:
         return cls.from_json(raw)
 
     @classmethod
-    def from_json(cls, raw: str) -> "PolicyRouter":
+    def from_json(cls, raw: str) -> PolicyRouter:
         """Parse a JSON document into a router.
 
         Document shape::

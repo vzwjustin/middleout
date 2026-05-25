@@ -214,7 +214,7 @@ def test_model_hint_for_anthropic_passes_through(monkeypatch) -> None:
             self.content = b'{"id":"m1","model":"claude-3-5-sonnet","content":[]}'
             self.headers = {"content-type": "application/json"}
 
-        def json(self):  # noqa: D401
+        def json(self):
             return json.loads(self.content.decode("utf-8"))
 
     class _FakeClient:
@@ -247,7 +247,7 @@ def test_audit_log_captures_request_model(monkeypatch) -> None:
             self.content = b'{"id":"m1","model":"claude-3-5-sonnet","content":[]}'
             self.headers = {"content-type": "application/json"}
 
-        def json(self):  # noqa: D401
+        def json(self):
             return json.loads(self.content.decode("utf-8"))
 
     class _FakeClient:
@@ -284,7 +284,7 @@ def test_brain_engine_headers_emitted_on_compressed_response(monkeypatch) -> Non
             self.content = b'{"id":"m1","model":"claude-3-5-sonnet","content":[]}'
             self.headers = {"content-type": "application/json"}
 
-        def json(self):  # noqa: D401
+        def json(self):
             return json.loads(self.content.decode("utf-8"))
 
     class _FakeClient:
@@ -588,7 +588,7 @@ def test_rate_limit_returns_429_when_exhausted(monkeypatch) -> None:
         content = b'{"id":"m1","model":"claude-3-5-sonnet","content":[]}'
         headers = {"content-type": "application/json"}
 
-        def json(self):  # noqa: D401
+        def json(self):
             import json as _j
 
             return _j.loads(self.content.decode("utf-8"))
@@ -644,7 +644,7 @@ def test_rate_limit_off_by_default_passes_through(monkeypatch) -> None:
         content = b'{"id":"m1","model":"claude-3-5-sonnet","content":[]}'
         headers = {"content-type": "application/json"}
 
-        def json(self):  # noqa: D401
+        def json(self):
             import json as _j
 
             return _j.loads(self.content.decode("utf-8"))
@@ -719,7 +719,7 @@ def test_policy_router_overrides_runtime_settings(monkeypatch) -> None:
         content = b'{"id":"m1","model":"claude-3-5-sonnet","content":[]}'
         headers = {"content-type": "application/json"}
 
-        def json(self):  # noqa: D401
+        def json(self):
             import json as _j
 
             return _j.loads(self.content.decode("utf-8"))

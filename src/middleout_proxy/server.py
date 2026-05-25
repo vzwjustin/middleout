@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import time
 from typing import Any
@@ -76,7 +77,7 @@ try:
         max_entries=settings.l1_cache_max_entries,
         max_body_bytes=settings.l1_cache_max_body_bytes,
     )
-except Exception as e:  # noqa: BLE001 — never fail boot on L1 db init
+except Exception as e:
     import logging
     logging.getLogger(__name__).warning(
         "L1 cache disabled at startup: %s: %s", type(e).__name__, e
@@ -92,7 +93,7 @@ except Exception as e:  # noqa: BLE001 — never fail boot on L1 db init
 # the runtime toggle in the dashboard can flip it on without a restart. When
 # settings say disabled, we start it with `enabled=False` — the runtime flag
 # alone flips `.enabled = True` afterwards.
-def _build_l2_cache(s: Settings) -> tuple["L2Cache", str | None]:
+def _build_l2_cache(s: Settings) -> tuple[L2Cache, str | None]:
     try:
         if s.l2_embedder == "openai":
             embedder = OpenAIEmbeddingClient(
@@ -129,7 +130,7 @@ def _build_l2_cache(s: Settings) -> tuple["L2Cache", str | None]:
             ),
             None,
         )
-    except Exception as e:  # noqa: BLE001 — never fail boot on L2 misconfig
+    except Exception as e:
         import logging
         logging.getLogger(__name__).warning(
             "L2 cache disabled at startup: %s: %s", type(e).__name__, e
@@ -518,8 +519,11 @@ async def preview(request: Request) -> JSONResponse:
             jl_dedupe=bool(rt["jl_dedupe"]),
             caveman=rt["caveman"],
             rtk=rt["rtk"],
+            input_compression=bool(rt["input_compression"]),
+            json_aware=rt["json_aware"],
+            lsh=rt["lsh"],
         )
-    except Exception as exc:  # noqa: BLE001 — preview never raises to client
+    except Exception as exc:
         return JSONResponse(
             status_code=500,
             content={
@@ -531,10 +535,18 @@ async def preview(request: Request) -> JSONResponse:
 
 @app.get("/metrics", response_class=PlainTextResponse)
 async def metrics() -> PlainTextResponse:
-    """Prometheus-format snapshot of audit + cache + cost counters."""
+    """Prometheus-format snapshot of audit + cache + cost counters.
+
+    The per-engine gauges report the live runtime state (input/output
+    compression, jl_dedupe, caveman, rtk, etc.) — not the startup config —
+    so an operator who flips a knob via /settings sees the change reflected
+    in Prometheus immediately.
+    """
     snap = audit_logger.stats.snapshot()
     snap["result_cache"] = compressor.result_cache.stats()
-    body = render_prometheus(snap, settings=settings)
+    async with _runtime_lock:
+        runtime_snapshot = _snapshot_runtime()
+    body = render_prometheus(snap, settings=settings, runtime=runtime_snapshot)
     return PlainTextResponse(content=body, media_type="text/plain; version=0.0.4")
 
 
@@ -580,7 +592,7 @@ async def cache_stats() -> dict[str, Any]:
         try:
             l1_stats = l1_cache.stats()  # type: ignore[union-attr]
             l1_stats["enabled"] = True
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             l1_stats = {"enabled": True, "error": str(exc)}
     return {
         "l1": l1_stats,
@@ -692,7 +704,7 @@ async def proxy(path: str, request: Request) -> Response:
     if model_hint:
         try:
             adapter = select_adapter(model="", model_hint=model_hint)
-        except Exception:  # noqa: BLE001 — registry errors fall back to anthropic
+        except Exception:
             adapter = None
         if adapter is not None and adapter.name != "anthropic":
             # Probe the adapter early; if it raises AdapterNotImplemented we
@@ -752,8 +764,7 @@ async def proxy(path: str, request: Request) -> Response:
     if rt["rate_limit"]:
         auth_header = request.headers.get("authorization") or ""
         if auth_header:
-            import hashlib as _hashlib
-            client_key = _hashlib.sha256(auth_header.encode("utf-8")).hexdigest()[:16]
+            client_key = hashlib.sha256(auth_header.encode("utf-8")).hexdigest()[:16]
             try:
                 allowed = await request_limiter.check(client_key)
             except Exception:
@@ -875,6 +886,7 @@ async def proxy(path: str, request: Request) -> Response:
                 rtk=engine_rtk,
                 json_aware=engine_json_aware,
                 lsh=engine_lsh,
+                force_enabled=True,
             )
             # FIX D: when nothing was touched, send the original bytes. Anthropic's
             # prompt cache is byte-keyed; re-encoding with stable separators still
@@ -1045,7 +1057,7 @@ async def proxy(path: str, request: Request) -> Response:
             try:
                 response_payload = upstream_response.json()
                 transformed_response, response_audit = compressor.compress_response_payload(
-                    response_payload, endpoint=path
+                    response_payload, endpoint=path, force_enabled=True,
                 )
                 if response_audit.touched:
                     response_content = json.dumps(
@@ -1364,7 +1376,12 @@ def _should_transform_json_request(path: str, method: str, headers: Any, body: b
 
 
 def _should_transform_json_response(path: str, headers: Any, body: bytes) -> bool:
-    if not settings.output_compression_enabled or not body:
+    # Pure routing predicate: does the response look like one we *could*
+    # rewrite? The runtime decision (`rt["output_compression"]`) is enforced
+    # at the call site. We deliberately do NOT consult
+    # `settings.output_compression_enabled` here — that would lock the gate
+    # to the startup value and silently break the runtime toggle.
+    if not body:
         return False
     if path.strip("/") != "v1/messages":
         return False

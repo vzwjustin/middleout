@@ -138,3 +138,33 @@ def test_request_limiter_rejects_empty_client_key():
             await limiter.check("")
 
     _run(run())
+
+
+def test_request_limiter_evicts_oldest_when_max_clients_exceeded():
+    """Past `max_clients`, the LRU oldest client is evicted on the next
+    novel-client insert. Evicted clients start with a full bucket on their
+    next request (fail-soft, no DoS amplification)."""
+    limiter = RequestLimiter(capacity=1, refill_per_second=1.0, max_clients=3)
+
+    async def run():
+        for i in range(3):
+            assert await limiter.check(f"client-{i}") is True
+        assert limiter.stats()["active_buckets"] == 3
+
+        # Bumping the cap forces eviction of client-0.
+        assert await limiter.check("client-3") is True
+        assert limiter.stats()["active_buckets"] == 3
+
+        # client-0 was evicted; its next check gets a fresh bucket (full).
+        assert await limiter.check("client-0") is True
+
+        # ... and client-1 should have been bumped to LRU position 1 by
+        # the eviction round; verify the cap holds.
+        assert limiter.stats()["active_buckets"] == 3
+
+    _run(run())
+
+
+def test_request_limiter_rejects_invalid_max_clients():
+    with pytest.raises(ValueError):
+        RequestLimiter(capacity=10, refill_per_second=1.0, max_clients=0)

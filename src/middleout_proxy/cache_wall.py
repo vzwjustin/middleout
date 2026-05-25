@@ -43,7 +43,8 @@ forward-looking replacement. Both must agree on every input — see
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 
 # Canonical kinds of blocks that participate in the prefix. Ordered by Anthropic
@@ -71,7 +72,7 @@ class WallMarker:
         # Bigger = later in processing order.
         return (_KIND_ORDER[self.kind], self.msg_idx if self.msg_idx is not None else -1, self.block_idx)
 
-    def __le__(self, other: "WallMarker") -> bool:  # type: ignore[override]
+    def __le__(self, other: WallMarker) -> bool:  # type: ignore[override]
         return self._order_key() <= other._order_key()
 
 
@@ -275,7 +276,7 @@ def assert_prefix_unchanged(
         prefix_len = min(len(original), len(outgoing))
     if original[:prefix_len] != outgoing[:prefix_len]:
         # Find first differing byte for the error message.
-        for i, (a, b) in enumerate(zip(original[:prefix_len], outgoing[:prefix_len])):
+        for i, (a, b) in enumerate(zip(original[:prefix_len], outgoing[:prefix_len], strict=True)):
             if a != b:
                 raise CacheWallViolation(
                     f"Cache prefix mutated at byte {i}: "

@@ -21,7 +21,7 @@ def _scrub_blocked_auth_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _reset_server_runtime() -> "object":
+def _reset_server_runtime() -> object:
     """Snapshot+restore server._runtime around every test.
 
     Without this, a test that flips a runtime flag via POST /settings

@@ -75,7 +75,7 @@ def test_aggressive_strips_line_comment():
 
 def test_aggressive_refuses_when_comment_in_string():
     src = '{"url": "https://example.com/path", "n": 1}'
-    out, stats = compress(src, "aggressive")
+    out, _stats = compress(src, "aggressive")
     assert json.loads(out) == json.loads(src)
     assert "https://example.com/path" in out
 

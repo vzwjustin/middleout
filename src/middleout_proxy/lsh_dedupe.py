@@ -38,7 +38,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import re
-from typing import Optional
 
 from .jl import shingles, tokenize
 
@@ -131,7 +130,7 @@ def _band_keys(signature: tuple[int, ...], bands: int, rows: int) -> list[bytes]
 def _jaccard_estimate(a: tuple[int, ...], b: tuple[int, ...]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
-    same = sum(1 for x, y in zip(a, b) if x == y)
+    same = sum(1 for x, y in zip(a, b, strict=True) if x == y)
     return same / len(a)
 
 
@@ -159,7 +158,7 @@ class LSHDedupeIndex:
         for b, key in enumerate(keys):
             self._bands[b].setdefault(key, []).append(block_id)
 
-    def find_near_duplicate(self, text: str) -> Optional[tuple[object, float]]:
+    def find_near_duplicate(self, text: str) -> tuple[object, float] | None:
         """Return (block_id, similarity) of the best candidate >= threshold, else None."""
         if not self._signatures:
             return None

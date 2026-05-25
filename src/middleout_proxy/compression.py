@@ -254,9 +254,17 @@ class PayloadCompressor:
         rtk: dict | None = None,
         json_aware: dict | None = None,
         lsh: dict | None = None,
+        force_enabled: bool = False,
     ) -> tuple[dict[str, Any], CompressionAudit]:
+        # The static `settings.input_compression_enabled` gate used to short-
+        # circuit here, which broke the runtime toggle: an operator who flipped
+        # input compression OFF at startup but turned it back ON via
+        # `/settings` would never see compression happen because the static
+        # gate fired first. Callers that *want* to honor the static gate can
+        # opt in via the `force_enabled=False` parameter; the server passes
+        # the runtime decision in and lets us run unconditionally.
         audit = CompressionAudit(endpoint=endpoint)
-        if not self.settings.input_compression_enabled:
+        if not force_enabled and not self.settings.input_compression_enabled:
             return payload, audit
 
         self._jl_active = self.settings.jl_dedupe_enabled if jl_dedupe is None else jl_dedupe
@@ -352,10 +360,12 @@ class PayloadCompressor:
         return working, audit
 
     def compress_response_payload(
-        self, payload: dict[str, Any], *, endpoint: str
+        self, payload: dict[str, Any], *, endpoint: str, force_enabled: bool = False,
     ) -> tuple[dict[str, Any], CompressionAudit]:
+        # Same runtime-gate concern as compress_request_payload — callers that
+        # already decided "yes, run" via a runtime flag pass `force_enabled=True`.
         audit = CompressionAudit(endpoint=endpoint)
-        if not self.settings.output_compression_enabled:
+        if not force_enabled and not self.settings.output_compression_enabled:
             return payload, audit
 
         working = copy.deepcopy(payload)
@@ -410,7 +420,7 @@ class PayloadCompressor:
                     # Reassign value to the deduped list and emit one audit event
                     # per replacement for the dashboard. The original lengths
                     # are recoverable from the marker strings.
-                    for i, (old, new) in enumerate(zip(value, new_value)):
+                    for i, (old, new) in enumerate(zip(value, new_value, strict=False)):
                         if old != new:
                             old_text = old.get("text") if isinstance(old, dict) else None
                             new_text = new.get("text") if isinstance(new, dict) else None

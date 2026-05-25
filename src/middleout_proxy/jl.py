@@ -18,7 +18,10 @@ __all__ = [
 ]
 
 _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?|[^\s]")
-_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+# Unicode-aware word matcher: ``\w`` honors locale by default in `re`, so
+# non-Latin scripts (Cyrillic, Greek, CJK) yield tokens instead of being
+# silently dropped — otherwise MinHash/SimHash collide all non-ASCII docs.
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
 
 
 def tokenize(text: str) -> list[str]:

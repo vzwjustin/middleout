@@ -57,11 +57,40 @@ _VOLATILE_TOP_LEVEL: frozenset[str] = frozenset({
 })
 
 
-def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
+# Headers that materially change upstream behavior must be folded into the
+# cache key, otherwise two requests with the same body but different api
+# versions / beta flags would collide. Stored under a sentinel namespace so
+# they can't shadow a real payload field.
+_KEY_HEADERS: tuple[str, ...] = ("anthropic-version", "anthropic-beta")
+_HEADERS_SENTINEL = "__headers__"
+
+
+def _select_key_headers(headers: dict[str, str] | None) -> dict[str, str]:
+    if not headers:
+        return {}
+    lowered = {k.lower(): v for k, v in headers.items()}
+    out: dict[str, str] = {}
+    for name in _KEY_HEADERS:
+        if name in lowered:
+            # anthropic-beta is a comma-separated set; sort tokens so order
+            # variations don't partition the cache.
+            value = lowered[name]
+            if name == "anthropic-beta":
+                tokens = sorted(t.strip() for t in value.split(",") if t.strip())
+                value = ",".join(tokens)
+            out[name] = value
+    return out
+
+
+def normalize_payload(
+    payload: dict[str, Any], *, headers: dict[str, str] | None = None
+) -> dict[str, Any]:
     """Return a copy of `payload` with volatile fields stripped.
 
     The result is suitable for canonical-encoding into a cache key. The original
-    payload is not modified.
+    payload is not modified. If `headers` is provided, key-affecting upstream
+    headers (anthropic-version, anthropic-beta) are folded in under a sentinel
+    so the same body sent against different API versions does not collide.
     """
     if not isinstance(payload, dict):
         # Defensive: hash whatever was passed. Non-dict payloads aren't valid
@@ -73,16 +102,21 @@ def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if k in _VOLATILE_TOP_LEVEL:
             continue
         out[k] = v
+    key_headers = _select_key_headers(headers)
+    if key_headers:
+        out[_HEADERS_SENTINEL] = key_headers
     return out
 
 
-def canonical_text(payload: dict[str, Any]) -> str:
+def canonical_text(
+    payload: dict[str, Any], *, headers: dict[str, str] | None = None
+) -> str:
     """Return the canonical JSON string used by both L1 and L2 cache layers.
 
     Exposed so the L2 layer can embed the *same* normalized text that L1 hashes,
     keeping the two layers' notion of "identical" aligned.
     """
-    normalized = normalize_payload(payload)
+    normalized = normalize_payload(payload, headers=headers)
     return json.dumps(
         normalized,
         separators=(",", ":"),
@@ -92,14 +126,16 @@ def canonical_text(payload: dict[str, Any]) -> str:
     )
 
 
-def cache_key(payload: dict[str, Any]) -> str:
+def cache_key(
+    payload: dict[str, Any], *, headers: dict[str, str] | None = None
+) -> str:
     """Return a SHA-256 hex digest of the canonical encoding of `payload`.
 
     Deterministic: same payload (modulo volatile fields) always produces the
     same key. Distinct payloads produce distinct keys with the cryptographic
     collision-resistance of SHA-256.
     """
-    encoded = canonical_text(payload).encode("utf-8")
+    encoded = canonical_text(payload, headers=headers).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 

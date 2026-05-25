@@ -20,14 +20,16 @@ _FILLER = {
 # capitalized, and not adjacent to punctuation that would change meaning).
 _ARTICLES = {"the", "a", "an"}
 
-# Pleasantries (multi-word phrases handled via regex).
+# Pleasantries — anchored to sentence boundary (start of segment or after
+# terminal punctuation) so transitive uses like "I thank the academy" or
+# "I knew he could you-know-what" are not silently deleted.
+_SENT_START = r"(?:^|(?<=[.!?]\s)|(?<=[.!?]\n)|(?<=^\n))"
 _PLEASANTRY_PATTERNS = [
-    (re.compile(r"\bplease\s+", re.IGNORECASE), ""),
-    (re.compile(r"\bthanks?(?:\s+you)?\b[,.!]?\s*", re.IGNORECASE), ""),
-    (re.compile(r"\bthank you\b[,.!]?\s*", re.IGNORECASE), ""),
-    (re.compile(r"\bcould you\b\s*", re.IGNORECASE), ""),
-    (re.compile(r"\bwould you\b\s*", re.IGNORECASE), ""),
-    (re.compile(r"\bcan you\b\s*", re.IGNORECASE), ""),
+    (re.compile(rf"{_SENT_START}please\s+", re.IGNORECASE), ""),
+    (re.compile(rf"{_SENT_START}(?:thanks|thank\s+you)\b[,.!]?\s*", re.IGNORECASE), ""),
+    (re.compile(rf"{_SENT_START}(?:could|would|can)\s+you\s+", re.IGNORECASE), ""),
+    # Trailing pleasantries are safe at end of sentence/segment.
+    (re.compile(r"\b(?:thanks|thank\s+you)\b[,.!]?\s*$", re.IGNORECASE | re.MULTILINE), ""),
 ]
 
 # Phrase collapses (standard level).

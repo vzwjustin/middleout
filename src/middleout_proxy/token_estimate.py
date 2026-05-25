@@ -13,6 +13,22 @@ from typing import Any
 __all__ = ["estimate_tokens", "estimate_tokens_for_payload", "summarize_token_stats"]
 
 
+def _is_cjk(ch: str) -> bool:
+    """Detect CJK/kana/Hangul characters — scripts where BPE produces roughly
+    one to two tokens per character, not one per 4 chars.
+    """
+    code = ord(ch)
+    # CJK Unified Ideographs + extensions, hiragana, katakana, Hangul.
+    return (
+        0x3040 <= code <= 0x30FF       # hiragana + katakana
+        or 0x3400 <= code <= 0x4DBF    # CJK Extension A
+        or 0x4E00 <= code <= 0x9FFF    # CJK Unified
+        or 0xAC00 <= code <= 0xD7AF    # Hangul syllables
+        or 0xF900 <= code <= 0xFAFF    # CJK compatibility
+        or 0x20000 <= code <= 0x2FFFF  # CJK Extensions B-F
+    )
+
+
 def estimate_tokens(text: str) -> int:
     """Return a non-negative token estimate for ``text``.
 
@@ -22,6 +38,8 @@ def estimate_tokens(text: str) -> int:
     * digits / 2 — digit-heavy text packs more tokens per character.
     * punctuation chars — every standalone symbol is roughly its own token.
     * whitespace_runs * 0.5 — separators have a small per-token cost.
+    * CJK / kana / Hangul chars * 1.5 — these scripts produce ~1-2 BPE tokens
+      per character; counting them as letters would under-estimate ~4-6x.
 
     Texts that are very uppercase-heavy or symbol-heavy fall back to
     ``len(text) / 3.5`` because BPE-style tokenizers produce many tiny tokens
@@ -35,6 +53,7 @@ def estimate_tokens(text: str) -> int:
     digits = 0
     punctuation = 0
     upper = 0
+    cjk = 0
     ws_runs = 0
 
     prev_ws = False
@@ -45,7 +64,9 @@ def estimate_tokens(text: str) -> int:
             prev_ws = True
             continue
         prev_ws = False
-        if ch.isalpha():
+        if _is_cjk(ch):
+            cjk += 1
+        elif ch.isalpha():
             letters += 1
             if ch.isupper():
                 upper += 1
@@ -59,7 +80,7 @@ def estimate_tokens(text: str) -> int:
     if upper_heavy or symbol_heavy:
         return max(1, int(round(n / 3.5)))
 
-    base = letters / 4.0 + digits / 2.0 + punctuation + ws_runs * 0.5
+    base = letters / 4.0 + digits / 2.0 + punctuation + ws_runs * 0.5 + cjk * 1.5
     return max(1, int(round(base)))
 
 

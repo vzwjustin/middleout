@@ -244,10 +244,14 @@ def _process_block(content: str, style: dict, level: str) -> str:
                 is_full = True
                 break
         if not is_full and block_for_full_line:
-            if stripped.startswith(block_for_full_line[0]) and stripped.rstrip().endswith(
-                block_for_full_line[1]
-            ):
-                is_full = True
+            # Only treat as a fully-commented line if nothing remains after
+            # stripping the inline block. ``/*x*/ var x = 1; /*y*/`` starts
+            # with ``/*`` and ends with ``*/`` but is not a comment line —
+            # there is code between the two blocks that we must preserve.
+            open_tok, close_tok = block_for_full_line
+            if stripped.startswith(open_tok) and stripped.rstrip().endswith(close_tok):
+                if _remove_inline_block(stripped, open_tok, close_tok).strip() == "":
+                    is_full = True
         if is_full:
             continue
         if level == "lite":

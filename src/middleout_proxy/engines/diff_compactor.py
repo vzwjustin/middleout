@@ -16,9 +16,16 @@ modified (other than the aggressive revert-pair drop).
 
 from __future__ import annotations
 
+import re
+
 from .base import EngineResult, make_result, validate_level
 
 NAME = "diff_compactor"
+
+# Real unified-diff hunk header: ``@@ -1,4 +1,4 @@``. Requiring this (rather
+# than a bare ``@@`` substring) avoids treating prose containing ``@@``
+# (emails, ``HEAD@@{1}``, etc.) as a diff.
+_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", re.MULTILINE)
 
 
 def _level_config(level: str) -> tuple[int, int, bool]:
@@ -99,7 +106,7 @@ def compress(text: str, *, level: str = "standard") -> EngineResult:
         return EngineResult(
             text=text, original_chars=len(text), compressed_chars=len(text)
         )
-    if "@@" not in text:
+    if not _HUNK_HEADER_RE.search(text):
         return EngineResult(
             text=text, original_chars=len(text), compressed_chars=len(text)
         )

@@ -143,8 +143,14 @@ def _process_fenced_segment(segment: str, level: str) -> tuple[str, int]:
     blocks_minified = 0
     new_body = body
 
-    if lang in ("json", "jsonc", "json5") or _parse_json_strict(body) is not None or (
-        level == "aggressive" and body.lstrip().startswith(("{", "["))
+    # Only attempt JSON minification when the fence is explicitly a JSON-ish
+    # language, or when there is no language tag at all. A ``python``/``js``
+    # fence whose body happens to also parse as JSON is still source code in
+    # that language and must keep its formatting.
+    json_eligible = lang in ("json", "jsonc", "json5") or lang == ""
+    if json_eligible and (
+        _parse_json_strict(body) is not None
+        or (level == "aggressive" and body.lstrip().startswith(("{", "[")))
     ):
         minified, did = _try_minify_block(body, level)
         if did:
@@ -155,6 +161,10 @@ def _process_fenced_segment(segment: str, level: str) -> tuple[str, int]:
         if blocks_minified == 0:
             new_body = _collapse_prose_whitespace(new_body)
 
+    # Preserve a trailing newline before the closing fence so it stays at
+    # column 0 — markdown requires the closing ``` to start its own line.
+    if body.endswith("\n") and not new_body.endswith("\n"):
+        new_body = new_body + "\n"
     return f"{header}\n{new_body}", blocks_minified
 
 

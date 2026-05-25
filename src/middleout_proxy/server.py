@@ -403,7 +403,18 @@ def _snapshot_runtime() -> dict[str, Any]:
 
 @app.post("/settings")
 async def post_settings(request: Request) -> Response:
-    body = await request.json()
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"invalid JSON: {exc.msg}"},
+        )
+    if not isinstance(body, dict):
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"body must be a JSON object, got {type(body).__name__}"},
+        )
     async with _runtime_lock:
         return await _post_settings_locked(body)
 
@@ -778,6 +789,24 @@ async def proxy(path: str, request: Request) -> Response:
                     },
                 )
 
+    # Even when input compression is disabled, parse the body so the L1/L2
+    # cache layers and the per-request model tag still have something to key
+    # on. The cache and the audit log are orthogonal to compression and must
+    # not be silently gated by it.
+    if (
+        not rt["input_compression"]
+        and _should_transform_json_request(path, request.method, request.headers, body_bytes)
+    ):
+        try:
+            _peek_payload = json.loads(body_bytes.decode("utf-8"))
+            if isinstance(_peek_payload, dict):
+                cache_lookup_payload = _peek_payload
+                m = _peek_payload.get("model")
+                if isinstance(m, str):
+                    request_model = m
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            pass
+
     try:
         if rt["input_compression"] and _should_transform_json_request(path, request.method, request.headers, body_bytes):
             payload = json.loads(body_bytes.decode("utf-8"))
@@ -929,9 +958,10 @@ async def proxy(path: str, request: Request) -> Response:
         and rt["l2_cache"]
         and l2_cache.enabled
     )
+    cache_key_headers = _cache_key_headers(request_headers)
     if cache_active:
         try:
-            l1_key = cache_key(cache_lookup_payload)  # type: ignore[arg-type]
+            l1_key = cache_key(cache_lookup_payload, headers=cache_key_headers)  # type: ignore[arg-type]
             cached = l1_cache.get(l1_key)  # type: ignore[union-attr]
         except Exception:
             cached = None
@@ -970,7 +1000,7 @@ async def proxy(path: str, request: Request) -> Response:
     # means). The L2 hit is served byte-for-byte, same as L1.
     if l2_active and (l1_status in (None, "miss")):
         try:
-            embed_text = canonical_text(cache_lookup_payload)  # type: ignore[arg-type]
+            embed_text = canonical_text(cache_lookup_payload, headers=cache_key_headers)  # type: ignore[arg-type]
             hit = l2_cache.get_similar(embed_text)
         except Exception:
             hit = None
@@ -1128,10 +1158,26 @@ async def proxy(path: str, request: Request) -> Response:
         # L1 + L2 CACHE STORE: on a successful upstream response, populate
         # both layers. L1 stores by exact-match key; L2 stores by embedding of
         # the same canonical normalized JSON. Both put() calls are best-effort.
-        if (cache_active or l2_active) and 200 <= upstream_response.status_code < 300 and cache_lookup_payload is not None:
+        # Skip caching responses that ended on `stop_reason: "tool_use"` —
+        # they contain `tool_use.id`s the client already correlated, and
+        # replaying them on a future identical prompt would hand the client
+        # a stale id to map.
+        should_cache_response = (
+            (cache_active or l2_active)
+            and 200 <= upstream_response.status_code < 300
+            and cache_lookup_payload is not None
+            and not _response_ends_in_tool_use(response_content, upstream_response.headers)
+        )
+        if should_cache_response:
+            # Drop per-request / per-response metadata that must NOT be replayed
+            # on a future cache hit (request-id pins this response to the
+            # original upstream call; cost reflects the original token usage;
+            # cache-status headers belong to the original miss; compression
+            # stats belong to the original request).
+            cacheable_headers = _strip_volatile_response_headers(response_headers)
             cached_resp = CachedResponse(
                 status_code=upstream_response.status_code,
-                headers=dict(response_headers),
+                headers=cacheable_headers,
                 body=bytes(response_content) if response_content else b"",
                 media_type=upstream_response.headers.get("content-type"),
             )
@@ -1144,8 +1190,12 @@ async def proxy(path: str, request: Request) -> Response:
                 try:
                     # The L2 point_id mirrors the L1 key when available so the
                     # two layers share a stable identity for the same content.
-                    point_id = l1_key or cache_key(cache_lookup_payload)
-                    embed_text = canonical_text(cache_lookup_payload)
+                    point_id = l1_key or cache_key(
+                        cache_lookup_payload, headers=cache_key_headers
+                    )
+                    embed_text = canonical_text(
+                        cache_lookup_payload, headers=cache_key_headers
+                    )
                     l2_cache.put_similar(embed_text, cached_resp, point_id=point_id)
                 except Exception:
                     pass
@@ -1247,6 +1297,82 @@ class _AdaptiveSkip(Exception):
     Caught by the request handler's catch-all; the payload is sent unchanged.
     Never escapes the handler.
     """
+
+
+# Headers whose value materially changes the upstream response and therefore
+# must be folded into the cache key. The cache layer sorts the anthropic-beta
+# token set itself, so order variations don't partition the cache.
+_CACHE_KEY_HEADER_NAMES: frozenset[str] = frozenset({
+    "anthropic-version",
+    "anthropic-beta",
+})
+
+
+def _cache_key_headers(headers: dict[str, str] | None) -> dict[str, str]:
+    """Project request headers down to the subset that affects upstream output.
+
+    Anything else (auth bearer, host, x-request-id, etc.) would partition the
+    cache by per-request metadata and defeat the whole point.
+    """
+    if not headers:
+        return {}
+    return {k: v for k, v in headers.items() if k.lower() in _CACHE_KEY_HEADER_NAMES}
+
+
+# Response headers that belong to THIS specific upstream call and must not
+# survive into a cached response replayed for a different request. Cache-status
+# headers and compression stats are re-stamped per-serve by the cache layer.
+_VOLATILE_RESPONSE_HEADERS: frozenset[str] = frozenset({
+    "request-id",
+    "x-request-id",
+    "x-brain-cost-usd",
+    "x-brain-l1-cache",
+    "x-brain-l1-hit-count",
+    "x-brain-l2-cache",
+    "x-brain-l2-similarity",
+    "x-middleout-input-chars-saved",
+    "x-middleout-input-events",
+    "x-middleout-output-chars-saved",
+    "x-middleout-output-events",
+    "x-middleout-warning",
+    "x-brain-chars-saved-in",
+    "x-brain-chars-saved-out",
+    "x-brain-engines",
+    "x-brain-engines-out",
+    "x-brain-lingua-chars-saved",
+    "x-brain-wall-auto-inserted",
+    "x-brain-resolved-adapter",
+    "date",
+    "content-length",
+})
+
+
+def _strip_volatile_response_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Return a copy of headers with per-request fields removed before caching."""
+    return {k: v for k, v in headers.items() if k.lower() not in _VOLATILE_RESPONSE_HEADERS}
+
+
+def _response_ends_in_tool_use(body: bytes | None, upstream_headers: Any) -> bool:
+    """Return True if an Anthropic Messages response ended with `tool_use`.
+
+    Such responses are mid-conversation and contain `tool_use.id`s the client
+    already mapped to results. Replaying them from cache on a future identical
+    prompt would hand the client a stale id.
+    """
+    if not body:
+        return False
+    try:
+        content_type = ""
+        if upstream_headers is not None:
+            content_type = str(upstream_headers.get("content-type", "")).lower()
+        if "application/json" not in content_type:
+            return False
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("stop_reason") == "tool_use"
 
 
 class StrictSubscriptionAuthError(ValueError):

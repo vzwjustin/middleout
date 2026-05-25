@@ -74,11 +74,26 @@ def _reset_server_runtime() -> object:
             pass
         # Clear L2 cache (in-memory vector store) so a previous test's
         # populated vectors don't trigger spurious near-duplicate hits.
+        # Use the public `clear()` API which works for both InMemory and
+        # Qdrant stores; falls back to a private-attr clear for tests that
+        # monkey-patched in a barebones store.
         try:
-            if _srv.l2_cache is not None and hasattr(_srv.l2_cache, "vector_store"):
-                vs = _srv.l2_cache.vector_store
-                if hasattr(vs, "_entries"):
-                    vs._entries.clear()  # type: ignore[attr-defined]
+            if _srv.l2_cache is not None:
+                try:
+                    _srv.l2_cache.clear()
+                except Exception:
+                    vs = getattr(_srv.l2_cache, "vector_store", None)
+                    if vs is not None:
+                        vs_clear = getattr(vs, "clear", None)
+                        if callable(vs_clear):
+                            vs_clear()
+                        else:
+                            # Older speculative impls might have used these
+                            # names; preserve compatibility.
+                            for attr in ("_points", "_entries"):
+                                bag = getattr(vs, attr, None)
+                                if bag is not None and hasattr(bag, "clear"):
+                                    bag.clear()
         except Exception:
             pass
         # Drop any in-flight buckets and replace the limiter with a fresh one

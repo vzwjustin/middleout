@@ -202,6 +202,30 @@ class L2Cache:
             "embedding_dim": getattr(self.embedding_client, "dim", None),
         }
 
+    def clear(self) -> int:
+        """Drop every cached entry. Returns the count of entries cleared.
+
+        Always safe to call: a missing vector store, or one that doesn't
+        implement ``clear()``, returns 0 without raising. Counters are
+        always reset.
+        """
+        cleared = 0
+        store = self.vector_store
+        if store is not None:
+            store_clear = getattr(store, "clear", None)
+            if callable(store_clear):
+                try:
+                    result = store_clear()
+                    cleared = int(result) if result is not None else 0
+                except Exception as e:
+                    logger.warning(
+                        "L2 clear() failed: %s: %s", type(e).__name__, e
+                    )
+                    cleared = 0
+        self.lookups = 0
+        self.hits = 0
+        return cleared
+
 
 def _response_to_metadata(response: CachedResponse) -> dict[str, Any]:
     """Serialize a CachedResponse to a Qdrant payload."""

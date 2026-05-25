@@ -276,10 +276,18 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # Close every long-lived resource. Each shutdown is independent so a
+        # failure in one tier (e.g. SQLite already closed by tests) never
+        # prevents another from running.
         try:
             await app.state.http.aclose()
         except Exception:
             pass
+        if l1_cache is not None:
+            try:
+                l1_cache.close()
+            except Exception:
+                pass
 
 
 app = FastAPI(
@@ -603,14 +611,24 @@ async def cache_stats() -> dict[str, Any]:
 
 @app.post("/cache/purge")
 async def cache_purge() -> dict[str, Any]:
-    """Drop every L1 entry. L2 is a stub — no-op until the embedding client lands."""
-    cleared = 0
+    """Drop every L1 + L2 entry. Returns per-tier cleared counts.
+
+    L1: SQLite (or memory-backed) exact-match cache. L2: in-process
+    InMemoryVectorStore or remote QdrantVectorStore via the L2Cache wrapper.
+    Both purges are best-effort; one tier's failure never blocks the other.
+    """
+    l1_cleared = 0
     if l1_cache is not None:
         try:
-            cleared = l1_cache.purge()  # type: ignore[union-attr]
+            l1_cleared = l1_cache.purge()  # type: ignore[union-attr]
         except Exception:
-            cleared = 0
-    return {"l1_cleared": cleared}
+            l1_cleared = 0
+    l2_cleared = 0
+    try:
+        l2_cleared = l2_cache.clear()
+    except Exception:
+        l2_cleared = 0
+    return {"l1_cleared": l1_cleared, "l2_cleared": l2_cleared}
 
 
 @app.get("/budget")

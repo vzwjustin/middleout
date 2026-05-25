@@ -110,6 +110,18 @@ class InMemoryVectorStore:
         with self._lock:
             self._points.pop(point_id, None)
 
+    def clear(self) -> int:
+        """Drop every stored point. Returns the number of entries removed.
+
+        Used by ``/cache/purge`` so operators can wipe semantic cache state
+        without restarting the proxy. The conftest fixture also calls this
+        between tests to prevent cross-test contamination.
+        """
+        with self._lock:
+            count = len(self._points)
+            self._points.clear()
+            return count
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._points)
@@ -213,6 +225,32 @@ class QdrantVectorStore:
             collection_name=self.collection,
             points_selector=qm.PointIdsList(points=[point_id]),
         )
+
+    def clear(self) -> int:
+        """Delete every point in the collection.
+
+        Best-effort: returns the prior entry count from ``stats()`` (or 0 on
+        error) and then issues a wholesale delete via a match-all filter.
+        Failures are logged and surfaced as 0 so the L1 purge still runs.
+        """
+        qm = self._qmodels
+        prior_count = 0
+        try:
+            info = self._client.get_collection(self.collection)
+            prior_count = int(getattr(info, "points_count", 0) or 0)
+        except Exception:
+            prior_count = 0
+        try:
+            self._client.delete(
+                collection_name=self.collection,
+                points_selector=qm.FilterSelector(filter=qm.Filter(must=[])),
+            )
+        except Exception as e:
+            logger.warning(
+                "Qdrant clear() failed: %s: %s", type(e).__name__, e
+            )
+            return 0
+        return prior_count
 
     def stats(self) -> dict[str, Any]:
         try:

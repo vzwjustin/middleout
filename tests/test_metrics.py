@@ -97,6 +97,7 @@ def test_required_metric_names_present():
         "middleout_cache_max_entries",
         "middleout_input_compression_enabled",
         "middleout_engine_enabled",
+        "middleout_feature_enabled",
         "middleout_jl_similarity_threshold",
     }
     present = {
@@ -104,6 +105,60 @@ def test_required_metric_names_present():
     }
     missing = required - present
     assert not missing, f"missing required metrics: {sorted(missing)}"
+
+
+def test_feature_gauges_track_runtime_state():
+    settings = Settings()
+    runtime = {
+        "l1_cache": True,
+        "l2_cache": False,
+        "auto_insert_wall": True,
+        "rate_limit": False,
+    }
+    output = render_prometheus(_sample_stats(), settings=settings, runtime=runtime)
+    assert 'middleout_feature_enabled{feature="l1_cache"} 1' in output
+    assert 'middleout_feature_enabled{feature="l2_cache"} 0' in output
+    assert 'middleout_feature_enabled{feature="auto_insert_cache_wall"} 1' in output
+    assert 'middleout_feature_enabled{feature="rate_limit"} 0' in output
+
+
+def test_feature_gauges_fall_back_to_settings_when_runtime_missing():
+    settings = Settings(
+        l1_cache_enabled=True,
+        l2_cache_enabled=False,
+        auto_insert_cache_wall=False,
+        rate_limit_enabled=True,
+    )
+    output = render_prometheus(_sample_stats(), settings=settings)
+    assert 'middleout_feature_enabled{feature="l1_cache"} 1' in output
+    assert 'middleout_feature_enabled{feature="l2_cache"} 0' in output
+    assert 'middleout_feature_enabled{feature="auto_insert_cache_wall"} 0' in output
+    assert 'middleout_feature_enabled{feature="rate_limit"} 1' in output
+
+
+def test_engine_chars_saved_total_emitted_when_engines_total_present():
+    settings = Settings()
+    stats = _sample_stats()
+    stats["engines_total"] = {"caveman": 1234, "jl_dedupe": 5678, "lingua": 99}
+    output = render_prometheus(stats, settings=settings)
+    assert "# TYPE middleout_engine_chars_saved_total counter" in output
+    assert 'middleout_engine_chars_saved_total{engine="caveman"} 1234' in output
+    assert 'middleout_engine_chars_saved_total{engine="jl_dedupe"} 5678' in output
+    assert 'middleout_engine_chars_saved_total{engine="lingua"} 99' in output
+
+
+def test_engine_chars_saved_total_omitted_when_engines_total_empty():
+    settings = Settings()
+    stats = _sample_stats()
+    # Empty dict and missing key should both omit the block (Prometheus dislikes
+    # a TYPE block with no samples).
+    stats["engines_total"] = {}
+    output = render_prometheus(stats, settings=settings)
+    assert "middleout_engine_chars_saved_total" not in output
+
+    stats.pop("engines_total", None)
+    output = render_prometheus(stats, settings=settings)
+    assert "middleout_engine_chars_saved_total" not in output
 
 
 def test_counter_values_match_stats():

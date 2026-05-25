@@ -202,6 +202,48 @@ def render_prometheus(
             emit_meta=False,
         )
 
+    # --- brain feature gauges (phase 2-4: caches, wall, rate limit) -------
+    lines.append(
+        "# HELP middleout_feature_enabled "
+        "Whether a named brain feature is enabled (1 = on, 0 = off)."
+    )
+    lines.append("# TYPE middleout_feature_enabled gauge")
+    feature_states: list[tuple[str, bool]] = [
+        ("l1_cache", _live("l1_cache", settings_attr="l1_cache_enabled")),
+        ("l2_cache", _live("l2_cache", settings_attr="l2_cache_enabled")),
+        (
+            "auto_insert_cache_wall",
+            _live("auto_insert_wall", settings_attr="auto_insert_cache_wall"),
+        ),
+        ("rate_limit", _live("rate_limit", settings_attr="rate_limit_enabled")),
+    ]
+    for feature_name, enabled in feature_states:
+        emit_gauge(
+            "middleout_feature_enabled",
+            "",
+            1 if enabled else 0,
+            labels={"feature": feature_name},
+            emit_meta=False,
+        )
+
+    # --- per-engine chars-saved counter (cumulative since process start) --
+    engines_total = stats.get("engines_total")
+    if isinstance(engines_total, dict) and engines_total:
+        lines.append(
+            "# HELP middleout_engine_chars_saved_total "
+            "Cumulative characters saved by engine since process start."
+        )
+        lines.append("# TYPE middleout_engine_chars_saved_total counter")
+        for engine_name in sorted(engines_total):
+            try:
+                saved = int(engines_total[engine_name])
+            except (TypeError, ValueError):
+                continue
+            lines.append(
+                "middleout_engine_chars_saved_total"
+                f'{{engine="{_escape_label_value(engine_name)}"}} {saved}'
+            )
+
     emit_gauge(
         "middleout_jl_similarity_threshold",
         "Configured JL-style near-duplicate similarity threshold (0.0-1.0).",

@@ -23,7 +23,12 @@ from .cache.vector_stores import InMemoryVectorStore, QdrantVectorStore
 from .cache_wall import compute_wall
 from .compression import CompressionAudit, PayloadCompressor
 from .config import Settings, load_settings
-from .cost import CostTracker, estimate as estimate_cost, extract_usage_from_anthropic
+from .cost import (
+    CostTracker,
+    SSEUsageAccumulator,
+    estimate as estimate_cost,
+    extract_usage_from_anthropic,
+)
 from .dashboard import _DASHBOARD_HTML
 from .lingua import LinguaCompressor
 from .metrics import render_prometheus
@@ -1115,30 +1120,15 @@ async def proxy(path: str, request: Request) -> Response:
                         except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
                             model_id = ""
                     usage = extract_usage_from_anthropic(response_payload_for_cost)
-                    cost_record = estimate_cost(
-                        provider="anthropic",
+                    cost_record = _record_anthropic_cost(
                         model=model_id or "",
-                        **usage,
+                        usage=usage,
+                        bytes_in=bytes_in,
                     )
-                    cost_tracker.record(cost_record)
                     if cost_record.matched:
                         response_headers["x-brain-cost-usd"] = (
                             f"{cost_record.usd:.6f}"
                         )
-                    # Update the usage budget. The proxy doesn't count
-                    # cache-read tokens against the input quota — they're
-                    # already paid for upstream of the request.
-                    try:
-                        usage_budget.record(
-                            chars=int(bytes_in or 0),
-                            tokens=int(
-                                usage.get("input_tokens", 0)
-                                + usage.get("output_tokens", 0)
-                                + usage.get("cache_write_tokens", 0)
-                            ),
-                        )
-                    except (TypeError, ValueError):
-                        pass
         except Exception:
             pass
 
@@ -1242,14 +1232,39 @@ async def _streaming_forward(
     )
 
     bytes_out = 0
+    # SSE cost tracking: only attach an accumulator on successful SSE responses
+    # to the Messages API. Non-SSE error bodies, non-2xx, and non-Messages paths
+    # all skip the parse — the accumulator costs zero in those cases.
+    upstream_ct = upstream_response.headers.get("content-type", "").lower()
+    sse_acc: SSEUsageAccumulator | None = None
+    if (
+        path.strip("/") == "v1/messages"
+        and 200 <= upstream_response.status_code < 300
+        and "text/event-stream" in upstream_ct
+    ):
+        sse_acc = SSEUsageAccumulator()
 
     async def body_iter():
         nonlocal bytes_out
         try:
             async for chunk in upstream_response.aiter_raw():
                 bytes_out += len(chunk)
+                if sse_acc is not None:
+                    sse_acc.feed(chunk)
                 yield chunk
         finally:
+            # Record cost from the SSE stream if we got at least the initial
+            # message_start event. Done in `finally` so client disconnects
+            # mid-stream still credit whatever we already parsed.
+            if sse_acc is not None and sse_acc.saw_message_start:
+                try:
+                    _record_anthropic_cost(
+                        model=sse_acc.model or request_model or "",
+                        usage=sse_acc.snapshot(),
+                        bytes_in=bytes_in,
+                    )
+                except Exception:  # noqa: BLE001 — cost is informational
+                    pass
             audit_logger.record(
                 method=method,
                 path=path,
@@ -1378,6 +1393,41 @@ def _brain_headers(*, lingua_chars_saved: int, wall_auto_inserted: bool) -> dict
     if wall_auto_inserted:
         out["x-brain-wall-inserted"] = "1"
     return out
+
+
+def _record_anthropic_cost(
+    *,
+    model: str,
+    usage: dict[str, int],
+    bytes_in: int,
+) -> Any:
+    """Record cost + budget for a parsed Anthropic usage block.
+
+    Returns the :class:`CostRecord` so the caller can stamp the response
+    header when running in non-streaming mode. Never raises — cost is
+    informational.
+    """
+    cost_record = estimate_cost(
+        provider="anthropic",
+        model=model or "",
+        **usage,
+    )
+    try:
+        cost_tracker.record(cost_record)
+    except Exception:  # noqa: BLE001 — informational pipeline must not break the request
+        pass
+    try:
+        usage_budget.record(
+            chars=int(bytes_in or 0),
+            tokens=int(
+                usage.get("input_tokens", 0)
+                + usage.get("output_tokens", 0)
+                + usage.get("cache_write_tokens", 0)
+            ),
+        )
+    except (TypeError, ValueError):
+        pass
+    return cost_record
 
 
 def _should_transform_json_request(path: str, method: str, headers: Any, body: bytes) -> bool:

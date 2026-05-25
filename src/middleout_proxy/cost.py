@@ -24,6 +24,7 @@ on usage receipts should treat this tracker's output as informational.
 
 from __future__ import annotations
 
+import json
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -281,6 +282,125 @@ def extract_usage_from_anthropic(payload: dict[str, Any] | None) -> dict[str, in
         "cache_write_tokens": _int("cache_creation_input_tokens"),
         "cache_read_tokens": _int("cache_read_input_tokens"),
     }
+
+
+class SSEUsageAccumulator:
+    """Stream-fed parser that extracts token usage from an Anthropic SSE body.
+
+    Anthropic's Messages SSE protocol emits:
+
+    - ``event: message_start`` -> ``{"message":{"model":"...","usage":{
+      "input_tokens":N, "cache_creation_input_tokens":M,
+      "cache_read_input_tokens":K, "output_tokens":0}}}``
+    - one or more ``content_block_*`` events (no usage)
+    - ``event: message_delta`` -> ``{"usage":{"output_tokens":FINAL}}``
+    - ``event: message_stop``
+
+    The accumulator is fed raw byte chunks as they arrive on the wire (via
+    :meth:`feed`). It buffers partial lines, parses each completed ``data:``
+    line as JSON, and tracks the per-axis token counts plus the model id
+    using ``max`` semantics so a transient zero never overwrites a real
+    count. The streaming forward path then snapshots :meth:`snapshot` in
+    its ``finally`` block and records to the cost tracker.
+
+    Robust to: split chunks, multiple events per chunk, CRLF or LF endings,
+    ``[DONE]`` sentinels, malformed JSON (skipped silently), and non-SSE
+    error bodies (returns zero usage, never raises).
+    """
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+        self._usage: dict[str, int] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_write_tokens": 0,
+            "cache_read_tokens": 0,
+        }
+        self._model: str | None = None
+        self._got_message_start = False
+
+    @property
+    def model(self) -> str | None:
+        return self._model
+
+    @property
+    def saw_message_start(self) -> bool:
+        return self._got_message_start
+
+    def snapshot(self) -> dict[str, int]:
+        """Return a copy of the accumulated usage. Safe to call multiple times."""
+        return dict(self._usage)
+
+    def feed(self, chunk: bytes) -> None:
+        """Feed a raw byte chunk from the upstream stream.
+
+        Cheap and non-blocking. Safe to call with empty bytes.
+        """
+        if not chunk:
+            return
+        self._buf.extend(chunk)
+        while True:
+            nl = self._buf.find(b"\n")
+            if nl < 0:
+                return
+            raw_line = bytes(self._buf[:nl])
+            del self._buf[: nl + 1]
+            # Tolerate CRLF.
+            if raw_line.endswith(b"\r"):
+                raw_line = raw_line[:-1]
+            if not raw_line.startswith(b"data:"):
+                # Lines like `event: message_start`, comments (`:`), or blank
+                # separators carry no payload — Anthropic always sends the full
+                # event JSON on the matching `data:` line.
+                continue
+            payload = raw_line[5:].lstrip()
+            if not payload or payload == b"[DONE]":
+                continue
+            try:
+                decoded = payload.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            try:
+                event = json.loads(decoded)
+            except ValueError:
+                continue
+            if isinstance(event, dict):
+                self._consume(event)
+
+    def _consume(self, event: dict[str, Any]) -> None:
+        ev_type = event.get("type")
+        if ev_type == "message_start":
+            message = event.get("message")
+            if isinstance(message, dict):
+                model = message.get("model")
+                if isinstance(model, str) and model:
+                    self._model = model
+                self._merge_usage(message.get("usage"))
+            self._got_message_start = True
+            return
+        if ev_type == "message_delta":
+            # `message_delta` carries the final `usage.output_tokens`. Some
+            # variants also echo cache fields; we max-merge so a partial
+            # event never erases prior real numbers.
+            self._merge_usage(event.get("usage"))
+
+    def _merge_usage(self, usage: Any) -> None:
+        if not isinstance(usage, dict):
+            return
+        # Anthropic input_tokens excludes cache-read tokens, so the three
+        # token axes are independent and `max` is the right merge.
+        for key, json_key in (
+            ("input_tokens", "input_tokens"),
+            ("output_tokens", "output_tokens"),
+            ("cache_write_tokens", "cache_creation_input_tokens"),
+            ("cache_read_tokens", "cache_read_input_tokens"),
+        ):
+            try:
+                value = int(usage.get(json_key, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if value > self._usage[key]:
+                self._usage[key] = value
 
 
 class CostTracker:

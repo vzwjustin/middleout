@@ -9,6 +9,7 @@ from middleout_proxy.cost import (
     PRICE_TABLE,
     PriceEntry,
     RequestCost,
+    SSEUsageAccumulator,
     estimate,
     extract_usage_from_anthropic,
     lookup_price,
@@ -258,3 +259,169 @@ def test_price_table_sonnet_under_opus() -> None:
     assert sonnet is not None and opus is not None
     assert sonnet.input_per_mtok < opus.input_per_mtok
     assert sonnet.output_per_mtok < opus.output_per_mtok
+
+
+# -- SSEUsageAccumulator ---------------------------------------------------
+
+
+def _sse_event(event: str, data: dict) -> bytes:
+    import json as _json
+    return f"event: {event}\ndata: {_json.dumps(data)}\n\n".encode()
+
+
+def _full_anthropic_stream(
+    *,
+    model: str = "claude-3-5-sonnet-20241022",
+    input_tokens: int = 1234,
+    output_tokens: int = 567,
+    cache_write: int = 0,
+    cache_read: int = 0,
+) -> bytes:
+    """Synthesize a realistic Anthropic SSE byte stream end-to-end."""
+    chunks: list[bytes] = []
+    chunks.append(
+        _sse_event(
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_x",
+                    "model": model,
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "cache_creation_input_tokens": cache_write,
+                        "cache_read_input_tokens": cache_read,
+                        "output_tokens": 0,
+                    },
+                },
+            },
+        )
+    )
+    chunks.append(_sse_event("content_block_start", {"type": "content_block_start", "index": 0}))
+    chunks.append(_sse_event("content_block_delta", {"type": "content_block_delta", "delta": {"text": "hello"}}))
+    chunks.append(_sse_event("content_block_stop", {"type": "content_block_stop", "index": 0}))
+    chunks.append(
+        _sse_event(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": output_tokens},
+            },
+        )
+    )
+    chunks.append(_sse_event("message_stop", {"type": "message_stop"}))
+    return b"".join(chunks)
+
+
+def test_sse_accumulator_parses_full_stream_in_one_chunk() -> None:
+    acc = SSEUsageAccumulator()
+    acc.feed(_full_anthropic_stream(input_tokens=1500, output_tokens=300))
+    assert acc.saw_message_start is True
+    assert acc.model == "claude-3-5-sonnet-20241022"
+    usage = acc.snapshot()
+    assert usage == {
+        "input_tokens": 1500,
+        "output_tokens": 300,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 0,
+    }
+
+
+def test_sse_accumulator_handles_chunks_split_mid_event() -> None:
+    """Real httpx streams split bytes wherever the kernel pleases."""
+    payload = _full_anthropic_stream(input_tokens=42, output_tokens=7)
+    acc = SSEUsageAccumulator()
+    # Feed one byte at a time — worst-case fragmentation.
+    for i in range(len(payload)):
+        acc.feed(payload[i : i + 1])
+    assert acc.saw_message_start
+    usage = acc.snapshot()
+    assert usage["input_tokens"] == 42
+    assert usage["output_tokens"] == 7
+
+
+def test_sse_accumulator_handles_multiple_events_per_chunk() -> None:
+    payload = _full_anthropic_stream(input_tokens=10, output_tokens=20)
+    acc = SSEUsageAccumulator()
+    acc.feed(payload)  # one big chunk
+    usage = acc.snapshot()
+    assert usage["input_tokens"] == 10
+    assert usage["output_tokens"] == 20
+
+
+def test_sse_accumulator_extracts_cache_tokens() -> None:
+    acc = SSEUsageAccumulator()
+    acc.feed(_full_anthropic_stream(input_tokens=500, cache_write=2000, cache_read=300))
+    usage = acc.snapshot()
+    assert usage["cache_write_tokens"] == 2000
+    assert usage["cache_read_tokens"] == 300
+
+
+def test_sse_accumulator_skips_malformed_json() -> None:
+    """One bad event must not poison the rest of the stream."""
+    acc = SSEUsageAccumulator()
+    acc.feed(b"event: junk\ndata: this is not json\n\n")
+    acc.feed(_full_anthropic_stream(input_tokens=99, output_tokens=11))
+    usage = acc.snapshot()
+    assert acc.saw_message_start
+    assert usage["input_tokens"] == 99
+    assert usage["output_tokens"] == 11
+
+
+def test_sse_accumulator_skips_done_sentinel() -> None:
+    acc = SSEUsageAccumulator()
+    acc.feed(b"data: [DONE]\n\n")
+    acc.feed(_full_anthropic_stream(input_tokens=1, output_tokens=2))
+    assert acc.snapshot()["input_tokens"] == 1
+
+
+def test_sse_accumulator_no_message_start_returns_empty() -> None:
+    """A non-SSE error body (or a stream that died before message_start) must not record cost."""
+    acc = SSEUsageAccumulator()
+    acc.feed(b'{"error": {"type": "overloaded_error"}}')  # body without SSE framing
+    assert acc.saw_message_start is False
+    assert all(v == 0 for v in acc.snapshot().values())
+
+
+def test_sse_accumulator_handles_crlf_line_endings() -> None:
+    """Some intermediaries normalize line endings to CRLF."""
+    payload = _full_anthropic_stream(input_tokens=77, output_tokens=44)
+    crlf = payload.replace(b"\n", b"\r\n")
+    acc = SSEUsageAccumulator()
+    acc.feed(crlf)
+    assert acc.saw_message_start
+    assert acc.snapshot()["input_tokens"] == 77
+    assert acc.snapshot()["output_tokens"] == 44
+
+
+def test_sse_accumulator_empty_feed_is_noop() -> None:
+    acc = SSEUsageAccumulator()
+    acc.feed(b"")
+    acc.feed(b"")
+    assert acc.saw_message_start is False
+    assert acc.model is None
+
+
+def test_sse_accumulator_max_merge_never_regresses() -> None:
+    """A late stray event with output_tokens=0 must not overwrite a higher value."""
+    acc = SSEUsageAccumulator()
+    acc.feed(_full_anthropic_stream(input_tokens=100, output_tokens=999))
+    # synthetic stray delta with zero usage — should be ignored
+    acc.feed(b'data: {"type":"message_delta","usage":{"output_tokens":0}}\n\n')
+    assert acc.snapshot()["output_tokens"] == 999
+
+
+def test_sse_accumulator_picks_up_model_from_message_start() -> None:
+    acc = SSEUsageAccumulator()
+    acc.feed(_full_anthropic_stream(model="claude-opus-4-2025-something", input_tokens=1, output_tokens=1))
+    assert acc.model == "claude-opus-4-2025-something"
+
+
+def test_sse_accumulator_handles_non_dict_event() -> None:
+    acc = SSEUsageAccumulator()
+    acc.feed(b"data: [1,2,3]\n\n")
+    acc.feed(b"data: null\n\n")
+    acc.feed(b"data: \"string\"\n\n")
+    # No usage captured; no crash.
+    assert acc.snapshot()["input_tokens"] == 0
